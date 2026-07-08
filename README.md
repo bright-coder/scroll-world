@@ -10,16 +10,41 @@ from *outside* each scene *into* its interior, then flows on to the next scene w
 cuts**. One continuous connected flight through a little generated world (think the Emons
 logistics site, applied to whatever you want).
 
+## Install
+
+### As a plugin (recommended)
+
+```
+/plugin marketplace add oso95/scroll-world
+/plugin install scroll-world@scroll-world
+```
+
+Then just ask for a scroll-through world landing page, or invoke `/scroll-world`.
+
+### Manually (drop-in skill)
+
+Copy the skill folder into your Claude Code skills directory:
+
+```bash
+git clone https://github.com/oso95/scroll-world
+cp -R scroll-world/plugins/scroll-world/skills/scroll-world ~/.claude/skills/
+```
+
+## Requirements
+
+- The [Higgsfield CLI](https://higgsfield.ai), authenticated (`higgsfield auth login`),
+  with credits.
+- `ffmpeg` / `ffprobe` for frame extraction and encoding.
+- Python 3 with Pillow (optional — only for the transparent-scene knockout).
+
+## What it does
+
 It leans on [Higgsfield](https://higgsfield.ai) for the art: cohesive isometric diorama
 scenes (GPT Image 2) and the camera flights themselves (Seedance image-to-video), scrubbed
 by scroll position — the same technique behind Apple's scroll-through product pages. The
-camera genuinely moves; scroll only drives time.
-
-**The skill is framework-agnostic.** It gives you the Higgsfield pipeline, the prompt
-templates, and a portable vanilla-JS scrub engine that drops into plain HTML, Next.js, Vue,
-or a Python-served page — nothing assumes a stack.
-
-## What it does
+camera genuinely moves; scroll only drives time. It's **framework-agnostic**: you get the
+Higgsfield pipeline, the prompt templates, and a portable vanilla-JS scrub engine that
+drops into plain HTML, Next.js, Vue, or a Python-served page — nothing assumes a stack.
 
 When invoked, the skill:
 
@@ -40,33 +65,6 @@ as the central rule.
 It also captures the non-obvious production gotchas: blob-URL loading so scrubbing works on
 hosts that don't serve HTTP byte-range requests, GOP/encoding settings that stay sharp
 without bloating, and Higgsfield's quirks.
-
-## Requirements
-
-- The [Higgsfield CLI](https://higgsfield.ai), authenticated (`higgsfield auth login`),
-  with credits.
-- `ffmpeg` / `ffprobe` for frame extraction and encoding.
-- Python 3 with Pillow (optional — only for the transparent-scene knockout).
-
-## Install
-
-### As a plugin (recommended)
-
-```
-/plugin marketplace add oso95/scroll-world
-/plugin install scroll-world@scroll-world
-```
-
-Then just ask for a scroll-through world landing page, or invoke `/scroll-world`.
-
-### Manually (drop-in skill)
-
-Copy the skill folder into your Claude Code skills directory:
-
-```bash
-git clone https://github.com/oso95/scroll-world
-cp -R scroll-world/plugins/scroll-world/skills/scroll-world ~/.claude/skills/
-```
 
 ## What's in the skill
 
