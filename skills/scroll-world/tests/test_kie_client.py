@@ -817,6 +817,23 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("--end-image", pipeline)
         self.assertIn("wait --manifest", pipeline)
 
+        mobile = pipeline.split("## 6. Native 9:16 mobile chain", 1)[1]
+        extraction_loop = """for name in $NAMES; do
+  ffmpeg -v error -y -ss 0 -i "$WORK/dive-mobile_$name.mp4" \\
+    -frames:v 1 -q:v 2 "$WORK/first-mobile_$name.png"
+  ffmpeg -v error -y -sseof -0.15 -i "$WORK/dive-mobile_$name.mp4" \\
+    -frames:v 1 -q:v 2 "$WORK/last-mobile_$name.png"
+done"""
+        self.assertIn(extraction_loop, mobile)
+        connector_inputs = """--start-image "$WORK/last-mobile_$previous.png" \\
+  --end-image "$WORK/first-mobile_$next.png"""
+        self.assertIn(connector_inputs, mobile)
+        self.assertLess(mobile.index(extraction_loop), mobile.index(connector_inputs))
+        self.assertIn(
+            'name=farm\npython3 "$SKILL/scripts/kie_client.py" generate-video',
+            mobile,
+        )
+
 
 # Keep this entry point at the end of the test file as later test classes are added.
 if __name__ == "__main__":

@@ -195,6 +195,7 @@ Generate every portrait dive with `--aspect-ratio 9:16 --resolution 720p --durat
 and `--start-image "$WORK/start-mobile_$name.png"`:
 
 ```bash
+name=farm
 python3 "$SKILL/scripts/kie_client.py" generate-video \
   --prompt-file "$WORK/dive-mobile_$name.txt" \
   --start-image "$WORK/start-mobile_$name.png" \
@@ -206,14 +207,16 @@ Extract `first-mobile_*.png` and `last-mobile_*.png` from those **rendered portr
 videos**, then use them for the portrait seams:
 
 ```bash
+for name in $NAMES; do
+  ffmpeg -v error -y -ss 0 -i "$WORK/dive-mobile_$name.mp4" \
+    -frames:v 1 -q:v 2 "$WORK/first-mobile_$name.png"
+  ffmpeg -v error -y -sseof -0.15 -i "$WORK/dive-mobile_$name.mp4" \
+    -frames:v 1 -q:v 2 "$WORK/last-mobile_$name.png"
+done
+
 index=1
 previous=farm
 next=kitchen
-ffmpeg -v error -y -ss 0 -i "$WORK/dive-mobile_$name.mp4" \
-  -frames:v 1 -q:v 2 "$WORK/first-mobile_$name.png"
-ffmpeg -v error -y -sseof -0.15 -i "$WORK/dive-mobile_$name.mp4" \
-  -frames:v 1 -q:v 2 "$WORK/last-mobile_$name.png"
-
 python3 "$SKILL/scripts/kie_client.py" generate-video \
   --prompt-file "$WORK/conn-mobile_$index.txt" \
   --start-image "$WORK/last-mobile_$previous.png" \
