@@ -801,6 +801,23 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue())["error"], "disk full")
 
 
+class DocumentationTests(unittest.TestCase):
+    def test_default_provider_and_commands_are_documented(self):
+        root = Path(__file__).resolve().parents[3]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        skill = (root / "skills/scroll-world/SKILL.md").read_text(encoding="utf-8")
+        pipeline = (root / "skills/scroll-world/references/pipeline-kie.md").read_text(
+            encoding="utf-8"
+        )
+        for text in (readme, skill, pipeline):
+            self.assertIn("bytedance/seedance-2-fast", text)
+        self.assertIn("STILLS_SOURCE=codex", skill)
+        self.assertIn("MEDIA_PROVIDER=kie", skill)
+        self.assertIn("generate-video", pipeline)
+        self.assertIn("--end-image", pipeline)
+        self.assertIn("wait --manifest", pipeline)
+
+
 # Keep this entry point at the end of the test file as later test classes are added.
 if __name__ == "__main__":
     unittest.main()
