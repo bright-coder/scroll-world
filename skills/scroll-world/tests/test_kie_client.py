@@ -202,6 +202,55 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(len(transport.requests), 1)
 
 
+class ManifestTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def test_create_task_persists_id_before_polling(self):
+        transport = FakeTransport(
+            [
+                json_response(
+                    200,
+                    {
+                        "code": 200,
+                        "msg": "success",
+                        "data": {"taskId": "task_bytedance_123"},
+                    },
+                )
+            ]
+        )
+        task_id = kie_client.create_task(
+            {"model": kie_client.DEFAULT_MODEL, "input": {"prompt": "move"}},
+            "secret",
+            transport,
+        )
+        self.assertEqual(task_id, "task_bytedance_123")
+
+    def test_create_task_rejects_a_non_object_response(self):
+        transport = FakeTransport([json_response(200, [])])
+        with self.assertRaisesRegex(kie_client.HttpError, "response schema"):
+            kie_client.create_task({"model": kie_client.DEFAULT_MODEL}, "secret", transport)
+
+    def test_manifest_write_is_atomic_and_has_no_secret(self):
+        path = Path(self.tempdir.name) / "clip.mp4.kie.json"
+        data = {"schemaVersion": 1, "taskId": "task_1", "state": "waiting"}
+        kie_client.write_manifest_atomic(path, data)
+        self.assertEqual(json.loads(path.read_text()), data)
+        self.assertFalse(path.with_suffix(path.suffix + ".tmp").exists())
+        self.assertNotIn("secret", path.read_text())
+
+    def test_existing_manifest_with_task_id_blocks_resubmission(self):
+        path = Path(self.tempdir.name) / "clip.mp4.kie.json"
+        kie_client.write_manifest_atomic(
+            path, {"schemaVersion": 1, "taskId": "task_existing"}
+        )
+        with self.assertRaisesRegex(kie_client.ValidationError, "wait"):
+            kie_client.ensure_new_generation(path)
+
+
 # Keep this entry point at the end of the test file as later test classes are added.
 if __name__ == "__main__":
     unittest.main()

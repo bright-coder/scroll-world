@@ -20,6 +20,8 @@ DEFAULT_MODEL = "bytedance/seedance-2-fast"
 VALID_ASPECT_RATIOS = {"16:9", "9:16"}
 VALID_RESOLUTIONS = {"720p"}
 UPLOAD_URL = "https://kieai.redpandaai.co/api/file-stream-upload"
+CREATE_TASK_URL = "https://api.kie.ai/api/v1/jobs/createTask"
+MANIFEST_SCHEMA_VERSION = 1
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
@@ -166,6 +168,75 @@ def upload_frame(
     ):
         raise HttpError("frame upload returned an invalid response schema")
     return download_url
+
+
+def manifest_path_for(output: Path) -> Path:
+    """Return the sidecar path used to persist a resumable task identity."""
+    return Path(str(output) + ".kie.json")
+
+
+def write_manifest_atomic(path: Path, data: Mapping[str, object]) -> None:
+    """Atomically replace a generation manifest with JSON data."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(str(path) + ".tmp")
+    temporary.write_text(
+        json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, path)
+
+
+def load_manifest(path: Path) -> dict[str, object] | None:
+    """Load a manifest, returning ``None`` when no previous task exists."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValidationError(f"manifest is not valid JSON: {path}") from error
+    if not isinstance(data, dict):
+        raise ValidationError(f"manifest must contain a JSON object: {path}")
+    return data
+
+
+def ensure_new_generation(path: Path) -> None:
+    """Reject generation when a saved task should be resumed with ``wait``."""
+    manifest = load_manifest(path)
+    if manifest is not None and isinstance(manifest.get("taskId"), str) and manifest["taskId"]:
+        raise ValidationError(f"existing task manifest found; use wait: {path}")
+
+
+def create_task(
+    payload: Mapping[str, object], api_key: str, transport: UrllibTransport
+) -> str:
+    """Submit a Kie.ai task and return its server-issued task identifier."""
+    if not api_key:
+        raise ValidationError("KIE_API_KEY must be set in the environment")
+    response = request_with_retry(
+        lambda: transport.request(
+            "POST",
+            CREATE_TASK_URL,
+            {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json.dumps(payload).encode("utf-8"),
+        )
+    )
+    if response.status != 200:
+        raise HttpError(f"task creation failed with HTTP status {response.status}")
+    try:
+        response_payload = json.loads(response.body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HttpError("task creation returned an invalid JSON response") from error
+    if not isinstance(response_payload, dict):
+        raise HttpError("task creation returned an invalid response schema")
+    data = response_payload.get("data")
+    task_id = data.get("taskId") if isinstance(data, dict) else None
+    if response_payload.get("code") != 200 or not isinstance(task_id, str) or not task_id:
+        raise HttpError("task creation returned an invalid response schema")
+    return task_id
 
 
 @dataclass(frozen=True)
