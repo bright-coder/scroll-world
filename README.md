@@ -90,6 +90,46 @@ Show me the estimated video cost and wait for my approval before generating.
 The skill interviews you about the scenes and visual direction before generating paid
 assets. It must obtain budget approval before submitting Kie video tasks.
 
+## Choose the output target
+
+`scroll-world` does not silently assume Plain HTML. It resolves the frontend in this
+order: your prompt, the current project's files and dependencies, a short confirmation,
+then a choice only when the project is empty or ambiguous.
+
+- Existing apps are adapted in place without replacing their router or styling setup.
+- Next.js App Router output uses a Client Component and defaults generated media to
+  `public/scroll-world/`.
+- React/Vite output uses a reusable component and defaults generated media to
+  `public/scroll-world/`.
+- Plain HTML uses the included template and is selected only when you ask for it.
+
+You can make the target explicit in the first prompt:
+
+```text
+$scroll-world Build this in Next.js App Router with TypeScript
+and keep generated media under public/scroll-world/.
+```
+
+```text
+$scroll-world Build this in React + Vite as a reusable ScrollWorld component
+and keep generated media under public/scroll-world/.
+```
+
+A typical React or Next.js delivery looks like:
+
+```text
+public/scroll-world/
+├── images/
+├── videos/
+└── scrub-engine.js
+components/
+└── ScrollWorld.tsx
+```
+
+If the skill confidently detects Next.js or React, it states the target briefly and lets
+you correct it. If detection is inconclusive, it asks you to choose Existing project,
+Next.js App Router, React/Vite, or Plain HTML before assembling the page.
+
 ## Install for development
 
 Clone the repository when you want to edit the skill, run its tests, or inspect the Kie
