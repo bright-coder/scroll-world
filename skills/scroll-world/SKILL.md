@@ -76,6 +76,31 @@ not the framework.
 
 ## Step 1 — Interview the user
 
+### Output target — resolve before the visual interview
+
+Resolve where the finished page belongs before asking about art direction. Use this exact
+decision order: **user prompt → project inspection → concise confirmation → fallback question**.
+
+1. **Honor the prompt.** If the user already requested an existing app, Next.js App
+   Router, React/Vite, Plain HTML, TypeScript/JavaScript, a route, component name, or asset
+   location, record it and do not ask the same question again.
+2. **Inspect the current project.** Read `package.json` and look for `next.config.*`, Vite
+   config, `app/`, `pages/`, and the existing routing/component/style conventions. A
+   `next` dependency or Next structure indicates Next.js; React plus Vite config indicates
+   React/Vite. Preserve another established frontend instead of replacing it.
+3. **Confirm a confident detection.** Say one short sentence such as *"I found a Next.js
+   App Router TypeScript project, so I'll add this as a Client Component and keep media in
+   `public/scroll-world/`; tell me if you want another target."* Continue unless corrected.
+4. **Ask only when unresolved.** For an empty, ambiguous, or conflicting project, ask one
+   choice: **Existing project / Next.js App Router / React/Vite / Plain HTML**.
+   **Never silently default to Plain HTML.**
+   If the selection does not resolve adapt-versus-scaffold or the integration
+   route/component, ask one concise follow-up before continuing.
+
+Record the framework and router, TypeScript or JavaScript, adapt-versus-scaffold choice,
+integration route/component, and public media directory. These decisions control Step 7;
+they do not change the provider, seam, mobile, or budget questions below.
+
 The **subject is the user's to state — ask it as an open question in plain prose**, never a
 fabricated multiple-choice. A made-up list of industries biases them and reads as you
 deciding their business for them; let them answer in their own words (their real business,
@@ -416,9 +441,25 @@ desktop-only, skip this — the engine still hardens phone scrubbing regardless
 
 ## Step 7 — Assemble the page
 
-Copy `references/scrub-engine.js` (and, if you want a fully standalone page, the tiny
-`references/index-template.html`) into the user's project — or adapt into their
-framework. It's config-driven and self-contained:
+Build the delivery shape selected in Step 1; the engine remains portable Vanilla JS:
+
+- **Existing project:** preserve its router, styling, file layout, and build conventions.
+  Adapt the smallest integration surface; do not replace or scaffold over the app.
+- **Next.js App Router:** create a **Client Component** because the engine uses `window`,
+  `document`, video elements, and scroll events. Put images, posters, clips, and the engine
+  under `public/scroll-world/` unless the project already has an asset convention; mount
+  the component from the requested `app/**/page.tsx`. Keep route metadata and useful
+  server-rendered copy outside the client-only boundary where practical.
+- **React/Vite:** create a reusable component, initialize the engine client-side after its
+  container exists, and default media to `public/scroll-world/` unless project conventions
+  say otherwise.
+- **Plain HTML:** use `references/index-template.html` with
+  `references/scrub-engine.js` and a local asset tree. Produce this shape only after the
+  user explicitly selects Plain HTML.
+
+Copy `references/scrub-engine.js` into the user's project—or adapt it into the selected
+framework. Copy `references/index-template.html` only when Plain HTML was explicitly selected.
+The engine is config-driven and self-contained:
 
 ```js
 mountScrollWorld(document.getElementById('world'), {

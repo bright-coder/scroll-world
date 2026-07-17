@@ -1265,6 +1265,34 @@ class EndToEndTests(unittest.TestCase):
 
 
 class DocumentationTests(unittest.TestCase):
+    def test_skill_resolves_and_documents_framework_output_target(self):
+        root = Path(__file__).resolve().parents[3]
+        skill = (root / "skills/scroll-world/SKILL.md").read_text(encoding="utf-8")
+        readme = (root / "README.md").read_text(encoding="utf-8")
+
+        required_skill_fragments = (
+            "Output target — resolve before the visual interview",
+            "user prompt → project inspection → concise confirmation → fallback question",
+            "Never silently default to Plain HTML",
+            "next.config.*",
+            "public/scroll-world/",
+            "Next.js App Router",
+            "React/Vite",
+            "ask one concise follow-up",
+            "only when Plain HTML was explicitly selected",
+        )
+        for fragment in required_skill_fragments:
+            self.assertIn(fragment, skill)
+
+        required_readme_fragments = (
+            "## Choose the output target",
+            "$scroll-world Build this in Next.js App Router with TypeScript",
+            "$scroll-world Build this in React + Vite",
+            "public/scroll-world/",
+        )
+        for fragment in required_readme_fragments:
+            self.assertIn(fragment, readme)
+
     def test_readme_documents_codex_first_installation(self):
         root = Path(__file__).resolve().parents[3]
         readme = (root / "README.md").read_text(encoding="utf-8")
