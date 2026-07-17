@@ -228,11 +228,23 @@ class ManifestTests(unittest.TestCase):
             transport,
         )
         self.assertEqual(task_id, "task_bytedance_123")
+        request = transport.requests[0]
+        self.assertEqual(request["method"], "POST")
+        self.assertEqual(request["url"], kie_client.CREATE_TASK_URL)
+        self.assertEqual(request["headers"]["Content-Type"], "application/json")
+        self.assertEqual(request["headers"]["Authorization"], "Bearer secret")
+        self.assertEqual(
+            json.loads(request["body"]),
+            {"model": kie_client.DEFAULT_MODEL, "input": {"prompt": "move"}},
+        )
+        self.assertNotIn(b"secret", request["body"])
 
     def test_create_task_rejects_a_non_object_response(self):
         transport = FakeTransport([json_response(200, [])])
         with self.assertRaisesRegex(kie_client.HttpError, "response schema"):
-            kie_client.create_task({"model": kie_client.DEFAULT_MODEL}, "secret", transport)
+            kie_client.create_task(
+                {"model": kie_client.DEFAULT_MODEL}, "secret", transport
+            )
 
     def test_manifest_write_is_atomic_and_has_no_secret(self):
         path = Path(self.tempdir.name) / "clip.mp4.kie.json"
@@ -240,6 +252,7 @@ class ManifestTests(unittest.TestCase):
         kie_client.write_manifest_atomic(path, data)
         self.assertEqual(json.loads(path.read_text()), data)
         self.assertFalse(path.with_suffix(path.suffix + ".tmp").exists())
+        self.assertFalse(list(path.parent.glob(path.name + ".*.tmp")))
         self.assertNotIn("secret", path.read_text())
 
     def test_existing_manifest_with_task_id_blocks_resubmission(self):
@@ -249,6 +262,59 @@ class ManifestTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(kie_client.ValidationError, "wait"):
             kie_client.ensure_new_generation(path)
+
+    def test_create_task_does_not_retry_a_retryable_failure(self):
+        transport = FakeTransport([json_response(503, {"msg": "try later"})])
+        with self.assertRaisesRegex(kie_client.HttpError, "not retried"):
+            kie_client.create_task(
+                {"model": kie_client.DEFAULT_MODEL}, "secret", transport
+            )
+        self.assertEqual(len(transport.requests), 1)
+
+    def test_submit_generation_writes_complete_waiting_manifest_immediately(self):
+        config = replace(make_config(), output=Path(self.tempdir.name) / "clip.mp4")
+        transport = FakeTransport(
+            [
+                json_response(
+                    200, {"code": 200, "data": {"taskId": "task_submitted"}}
+                )
+            ]
+        )
+
+        task_id = kie_client.submit_generation(
+            config,
+            "https://files.example/start.png",
+            "https://files.example/end.png",
+            "secret-value",
+            transport,
+        )
+
+        manifest_path = kie_client.manifest_path_for(config.output)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(task_id, "task_submitted")
+        self.assertEqual(manifest["schemaVersion"], kie_client.MANIFEST_SCHEMA_VERSION)
+        self.assertEqual(manifest["model"], config.model)
+        self.assertEqual(manifest["parameters"], {
+            "aspectRatio": config.aspect_ratio,
+            "duration": config.duration,
+            "resolution": config.resolution,
+            "timeoutSeconds": config.timeout_seconds,
+        })
+        self.assertEqual(manifest["localInputs"], {
+            "promptFile": str(config.prompt_file),
+            "startImage": str(config.start_image),
+            "endImage": None,
+        })
+        self.assertEqual(manifest["uploadedUrls"], {
+            "firstFrame": "https://files.example/start.png",
+            "lastFrame": "https://files.example/end.png",
+        })
+        self.assertEqual(manifest["taskId"], "task_submitted")
+        self.assertEqual(manifest["state"], "waiting")
+        self.assertEqual(manifest["outputPath"], str(config.output))
+        self.assertTrue(manifest["createdAt"].endswith("+00:00"))
+        self.assertEqual(manifest["createdAt"], manifest["updatedAt"])
+        self.assertNotIn("secret-value", manifest_path.read_text(encoding="utf-8"))
 
 
 # Keep this entry point at the end of the test file as later test classes are added.

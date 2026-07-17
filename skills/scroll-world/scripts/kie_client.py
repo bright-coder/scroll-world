@@ -7,9 +7,11 @@ import json
 import mimetypes
 import os
 import random
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 from urllib.error import HTTPError, URLError
@@ -179,11 +181,22 @@ def write_manifest_atomic(path: Path, data: Mapping[str, object]) -> None:
     """Atomically replace a generation manifest with JSON data."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(str(path) + ".tmp")
-    temporary.write_text(
-        json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    os.replace(temporary, path)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temporary_file:
+        temporary = Path(temporary_file.name)
+        json.dump(data, temporary_file, indent=2, sort_keys=True)
+        temporary_file.write("\n")
+    try:
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def load_manifest(path: Path) -> dict[str, object] | None:
@@ -213,8 +226,8 @@ def create_task(
     """Submit a Kie.ai task and return its server-issued task identifier."""
     if not api_key:
         raise ValidationError("KIE_API_KEY must be set in the environment")
-    response = request_with_retry(
-        lambda: transport.request(
+    try:
+        response = transport.request(
             "POST",
             CREATE_TASK_URL,
             {
@@ -223,9 +236,15 @@ def create_task(
             },
             json.dumps(payload).encode("utf-8"),
         )
-    )
+    except HttpError as error:
+        raise HttpError(
+            "task creation was not retried to avoid duplicate spend"
+        ) from error
     if response.status != 200:
-        raise HttpError(f"task creation failed with HTTP status {response.status}")
+        raise HttpError(
+            f"task creation failed with HTTP status {response.status}; "
+            "it was not retried to avoid duplicate spend"
+        )
     try:
         response_payload = json.loads(response.body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -307,6 +326,47 @@ def build_task_payload(
     if last_url is not None:
         inputs["last_frame_url"] = last_url
     return {"model": config.model, "input": inputs}
+
+
+def submit_generation(
+    config: GenerationConfig,
+    first_url: str,
+    last_url: str | None,
+    api_key: str,
+    transport: UrllibTransport,
+) -> str:
+    """Submit uploaded inputs and immediately persist a resumable task manifest."""
+    manifest_path = manifest_path_for(config.output)
+    ensure_new_generation(manifest_path)
+    task_id = create_task(
+        build_task_payload(config, first_url, last_url), api_key, transport
+    )
+    timestamp = datetime.now(timezone.utc).isoformat()
+    write_manifest_atomic(
+        manifest_path,
+        {
+            "schemaVersion": MANIFEST_SCHEMA_VERSION,
+            "model": config.model,
+            "parameters": {
+                "aspectRatio": config.aspect_ratio,
+                "duration": config.duration,
+                "resolution": config.resolution,
+                "timeoutSeconds": config.timeout_seconds,
+            },
+            "localInputs": {
+                "promptFile": str(config.prompt_file),
+                "startImage": str(config.start_image),
+                "endImage": str(config.end_image) if config.end_image else None,
+            },
+            "uploadedUrls": {"firstFrame": first_url, "lastFrame": last_url},
+            "taskId": task_id,
+            "state": "waiting",
+            "outputPath": str(config.output),
+            "createdAt": timestamp,
+            "updatedAt": timestamp,
+        },
+    )
+    return task_id
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
