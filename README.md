@@ -10,50 +10,168 @@ from *outside* each scene *into* its interior, then flows on to the next scene w
 cuts**. One continuous connected flight through a little generated world (think the Emons
 logistics site, applied to whatever you want).
 
-## Install
+## Quick start — Codex
 
-### Claude Code — as a plugin (recommended)
+Install the skill once, then use `$scroll-world` from any project in Codex. Still images
+use Codex's built-in `image_gen`; video generation defaults to Kie.ai
+`bytedance/seedance-2-fast`.
 
+### 1. Install prerequisites
+
+You need:
+
+- [Codex](https://openai.com/codex/) with the built-in `image_gen` tool.
+- Node.js 18 or newer so `npx` can run the Skills CLI.
+- Python 3.
+- `ffmpeg` and `ffprobe`.
+- A funded [Kie.ai](https://kie.ai) API key for video generation.
+
+Check the local tools:
+
+```bash
+node --version
+python3 --version
+ffmpeg -version
+ffprobe -version
 ```
-/plugin marketplace add oso95/scroll-world
+
+### 2. Install the skill globally
+
+The [Skills CLI](https://github.com/vercel-labs/skills) installs this repository's
+`scroll-world` skill into Codex:
+
+```bash
+npx skills add bright-coder/scroll-world --skill scroll-world -g -a codex -y
+```
+
+`-g` makes the skill available across projects, `-a codex` targets Codex, and `-y`
+accepts the installation prompts.
+
+### 3. Verify the installation
+
+```bash
+npx skills list -g -a codex
+```
+
+The output should list `scroll-world`. Restart Codex if it was open during installation.
+This check is local and does not create a paid Kie task.
+
+### 4. Configure a project
+
+Open the project where Codex will build the scroll site and create an ignored
+`.env.local` there. Do not put the key in the globally installed skill directory.
+
+If the project already contains this repository's example file:
+
+```bash
+cp .env.example .env.local
+```
+
+Otherwise, create `.env.local` with:
+
+```dotenv
+KIE_API_KEY=replace-with-your-kie-api-key
+KIE_MODEL=bytedance/seedance-2-fast
+```
+
+Keep `.env.local` out of Git and never paste or print the real key in logs. `KIE_MODEL`
+is optional; omitting it uses `bytedance/seedance-2-fast`.
+
+### 5. Start in Codex
+
+Open Codex in the configured project and ask:
+
+```text
+$scroll-world Build a scroll-through landing page for a parcel delivery company.
+Use Codex image generation for the scene stills and Kie.ai for the videos.
+Show me the estimated video cost and wait for my approval before generating.
+```
+
+The skill interviews you about the scenes and visual direction before generating paid
+assets. It must obtain budget approval before submitting Kie video tasks.
+
+## Install for development
+
+Clone the repository when you want to edit the skill, run its tests, or inspect the Kie
+client:
+
+```bash
+git clone https://github.com/bright-coder/scroll-world.git
+cd scroll-world
+npx skills add ./skills/scroll-world --skill scroll-world -g -a codex -y
+python3 -m unittest discover -s skills/scroll-world/tests -v
+```
+
+Inspect the client commands without making a network request or spending credits:
+
+```bash
+python3 skills/scroll-world/scripts/kie_client.py --help
+```
+
+## Update or uninstall
+
+Update the installed skill from its recorded source:
+
+```bash
+npx skills update scroll-world -g -y
+```
+
+Remove it from Codex:
+
+```bash
+npx skills remove scroll-world -g -a codex -y
+```
+
+## Other agents
+
+### Claude Code plugin
+
+```text
+/plugin marketplace add bright-coder/scroll-world
 /plugin install scroll-world@scroll-world
 ```
 
-Then just ask for a scroll-through world landing page, or invoke `/scroll-world`.
+Then invoke `/scroll-world` or ask for a scroll-through landing page.
 
-### Codex & other agents — via the skills CLI
+### Skills CLI interactive install
 
-Using [Vercel's skills CLI](https://github.com/vercel-labs/skills), which installs into
-Codex, Claude Code, Cursor, and 20+ other agents:
+The Skills CLI supports Claude Code, Cursor, and many other compatible agents. Omit the
+Codex target to choose interactively:
 
 ```bash
-npx skills add oso95/scroll-world            # pick your agent(s) when prompted
-npx skills add oso95/scroll-world -a codex   # or target Codex directly
+npx skills add bright-coder/scroll-world
 ```
 
-In Codex, invoke it with `$scroll-world` (or `/skills` to browse), or just ask for a
-scroll-through world landing page.
-
-### Manually (drop-in skill)
-
-Copy the skill folder into your agent's skills directory:
+### Manual copy
 
 ```bash
-git clone https://github.com/oso95/scroll-world
+git clone https://github.com/bright-coder/scroll-world.git
 cp -R scroll-world/skills/scroll-world ~/.claude/skills/   # Claude Code
 cp -R scroll-world/skills/scroll-world ~/.codex/skills/    # Codex
 ```
 
-## Requirements
+## Troubleshooting
 
-- Codex with its built-in `image_gen` tool for the default still-image workflow.
-- A [Kie.ai](https://kie.ai) API key in the project's ignored `.env.local`, plus enough
-  credits for `bytedance/seedance-2-fast` video generations.
-- `ffmpeg` / `ffprobe` for frame extraction and encoding.
-- Python 3 (the Kie client uses only the standard library). Pillow is optional for
-  background knockout work.
-- Optional fallback: the [Higgsfield CLI](https://higgsfield.ai), authenticated with
-  credits.
+- **`ffmpeg` or `ffprobe` not found:** install FFmpeg, then restart the terminal and
+  Codex so the updated `PATH` is loaded.
+- **Python reports `CERTIFICATE_VERIFY_FAILED`:** install or select a Python runtime with
+  a current CA certificate bundle. Do not disable TLS verification.
+- **Kie frame upload returns HTTP 403:** confirm the same key and account in the Kie
+  dashboard, then contact Kie support if the upload service still rejects it. Do not
+  repeatedly submit replacement paid tasks.
+- **Codex cannot see `$scroll-world`:** run `npx skills list -g -a codex`, reinstall the
+  skill if it is missing, and restart Codex.
+- **A Kie submission is marked uncertain:** keep its manifest and reconcile the Kie task
+  history or contact support before authorizing any replacement task.
+
+## Requirements and providers
+
+- Codex built-in `image_gen` is the default still-image workflow.
+- Kie.ai `bytedance/seedance-2-fast` is the default video model.
+- `ffmpeg` / `ffprobe` handle frame extraction, validation, and encoding.
+- Python 3 runs the dependency-free Kie client. Pillow is optional for background
+  knockout work.
+- The [Higgsfield CLI](https://higgsfield.ai) remains an optional authenticated fallback.
 
 ### Provider matrix
 
@@ -111,16 +229,6 @@ skills/scroll-world/
   approval, runs generations detached, and preserves resumable Kie manifests. Codex
   stills use the user's Codex allowance; the Higgsfield fallback has its own credit cost.
 - The generated `.mp4`/`.webp` assets are produced per project; they're not shipped here.
-
-## Star History
-
-<a href="https://www.star-history.com/?type=date&repos=oso95%2Fscroll-world">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=oso95/scroll-world&type=date&theme=dark&legend=top-left&sealed_token=rsHNX9eWfbhlu820oC1dzsc66Y8UZI4dawuHvAUlbn36F0gwOWXRDi-Qq4QFopkoEJE7bzgXPUkAmSnmMcglxAo_rM7TvGDKFehk5MzprmeT2euDRbHnTQZIxEWwjjpGQ3nodpdblW6WjTssURtDxXO2MCVL_WgJ_WnCIoVbV8qhsB_Z-Eeo8KCyVerC" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=oso95/scroll-world&type=date&legend=top-left&sealed_token=rsHNX9eWfbhlu820oC1dzsc66Y8UZI4dawuHvAUlbn36F0gwOWXRDi-Qq4QFopkoEJE7bzgXPUkAmSnmMcglxAo_rM7TvGDKFehk5MzprmeT2euDRbHnTQZIxEWwjjpGQ3nodpdblW6WjTssURtDxXO2MCVL_WgJ_WnCIoVbV8qhsB_Z-Eeo8KCyVerC" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=oso95/scroll-world&type=date&legend=top-left&sealed_token=rsHNX9eWfbhlu820oC1dzsc66Y8UZI4dawuHvAUlbn36F0gwOWXRDi-Qq4QFopkoEJE7bzgXPUkAmSnmMcglxAo_rM7TvGDKFehk5MzprmeT2euDRbHnTQZIxEWwjjpGQ3nodpdblW6WjTssURtDxXO2MCVL_WgJ_WnCIoVbV8qhsB_Z-Eeo8KCyVerC" />
- </picture>
-</a>
 
 ## License
 

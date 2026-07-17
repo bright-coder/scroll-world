@@ -1265,6 +1265,26 @@ class EndToEndTests(unittest.TestCase):
 
 
 class DocumentationTests(unittest.TestCase):
+    def test_readme_documents_codex_first_installation(self):
+        root = Path(__file__).resolve().parents[3]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        required_readme_fragments = (
+            "npx skills add bright-coder/scroll-world --skill scroll-world -g -a codex -y",
+            "cp .env.example .env.local",
+            "KIE_API_KEY=replace-with-your-kie-api-key",
+            "npx skills list -g -a codex",
+            "python3 skills/scroll-world/scripts/kie_client.py --help",
+            "python3 -m unittest discover -s skills/scroll-world/tests -v",
+            "$scroll-world",
+        )
+        for fragment in required_readme_fragments:
+            self.assertIn(fragment, readme)
+        self.assertNotIn("npx skills add oso95/scroll-world", readme)
+        self.assertNotIn(
+            "git clone https://github.com/oso95/scroll-world",
+            readme,
+        )
+
     def test_default_provider_and_commands_are_documented(self):
         root = Path(__file__).resolve().parents[3]
         readme = (root / "README.md").read_text(encoding="utf-8")
