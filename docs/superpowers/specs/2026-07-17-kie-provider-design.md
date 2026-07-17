@@ -8,6 +8,7 @@ Add Kie.ai as the default video-generation provider for Scroll World while retai
 
 - Generate a video from a local first frame with one command.
 - Generate a frame-locked connector from local first and last frames.
+- Let Codex use its built-in `image_gen` tool to create project-local scene stills before invoking Kie.ai for video.
 - Use `bytedance/seedance-2-fast` by default.
 - Poll asynchronous tasks and download the generated MP4 immediately.
 - Persist the task ID before polling so interrupted work can resume without spending credits twice.
@@ -21,6 +22,7 @@ Add Kie.ai as the default video-generation provider for Scroll World while retai
 - A webhook server; the local CLI uses polling.
 - Replacing FFmpeg, the scrub engine, prompt templates, or seam-locking rules.
 - Automatically generating all story assets in a single command.
+- Calling Codex's built-in `image_gen` tool from the standalone Python client. Built-in image generation is an agent capability, not a Kie client API.
 
 ## Repository Structure
 
@@ -45,9 +47,32 @@ The client reads credentials only from the environment:
 MEDIA_PROVIDER=kie
 KIE_API_KEY=
 KIE_MODEL=bytedance/seedance-2-fast
+STILLS_SOURCE=codex
 ```
 
 `MEDIA_PROVIDER` documents the selected workflow; the Python client itself is explicitly Kie-specific. `KIE_MODEL` is optional and defaults to `bytedance/seedance-2-fast`. The API key is not accepted as a command-line argument, written to a manifest, or included in logs. `.env.local` and other local secret files are ignored by Git; an example file contains names only, never credentials.
+
+`STILLS_SOURCE=codex` tells the Scroll World skill that, when it is running inside Codex, scene stills should be created with the built-in `image_gen` tool. This path does not require `OPENAI_API_KEY`. Outside Codex, the user supplies local stills or follows the retained Higgsfield still-generation instructions.
+
+## Codex Image Generation Flow
+
+When the skill runs in Codex, the agent orchestrates image and video generation as two separate capabilities:
+
+```text
+shared scene style and prompt
+→ Codex built-in image_gen
+→ inspect and approve the generated still
+→ copy the selected image into the project workspace
+→ normalize it onto a 16:9 or 9:16 canvas
+→ Kie client uploads the local frame
+→ Seedance 2 Fast generates the video
+```
+
+Codex invokes built-in `image_gen` once per distinct scene or variant, reusing the same style preamble across the complete scene set. A generated image intended for the project must be copied from Codex's generated-image location into the workspace; the pipeline never depends on an external or temporary Codex path.
+
+The normalized canvas becomes both the visual starting frame and the matching poster source. Landscape video uses a 16:9 canvas. A native mobile chain uses a separate 9:16 canvas and separate Kie.ai generations. The pipeline does not silently crop the landscape chain and label it as the mobile version.
+
+Only the initial scene artwork comes from `image_gen`. Seam handoffs never regenerate boundary images: connectors use first and last frames extracted from the actual rendered videos with FFmpeg, preserving the existing frame-lock rule.
 
 ## Command Interface
 
@@ -173,6 +198,7 @@ After automated tests pass, run one real first-frame video generation using Kie.
 
 - `README.md`: explain that this fork defaults to Kie.ai and retains Higgsfield as a fallback.
 - `SKILL.md`: change bootstrap, budget, model selection, and generation instructions to route to `pipeline-kie.md` by default.
+- `SKILL.md`: document the Codex orchestration path as `STILLS_SOURCE=codex` plus `MEDIA_PROVIDER=kie`, including project-local save and canvas normalization requirements.
 - `pipeline-kie.md`: provide copy-paste examples for dives, connectors, frame extraction, encoding, mobile variants, resume, and troubleshooting.
 - Existing `pipeline.md`: add only a clear Higgsfield fallback label if needed; preserve its commands.
 - `.env.example`: list safe configuration names with blank values.
@@ -182,6 +208,7 @@ After automated tests pass, run one real first-frame video generation using Kie.
 
 - The complete automated test suite passes without network access.
 - A first-frame task produces a valid local MP4 in a real Kie.ai smoke test.
+- In a Codex run, one built-in `image_gen` still is saved in the workspace, normalized to the requested video aspect ratio, and accepted by the Kie upload step.
 - A connector request is verified by automated request-contract tests with both uploaded frame URLs.
 - Interrupting after task creation and running `wait` resumes the same task ID.
 - No API key appears in Git history, logs, manifests, test fixtures, or process arguments.
