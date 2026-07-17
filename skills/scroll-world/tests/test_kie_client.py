@@ -445,8 +445,14 @@ class ManifestTests(unittest.TestCase):
         self.assertIsNone(manifest["taskId"])
         self.assertIn("not retried", manifest["lastError"])
         request_count = len(transport.requests)
-        with self.assertRaisesRegex(kie_client.ValidationError, "reservation.*wait"):
+        with self.assertRaises(kie_client.ValidationError) as raised:
             kie_client.run_generate(config, "secret", transport)
+        message = str(raised.exception).lower()
+        self.assertIn("retain", message)
+        self.assertIn("manifest", message)
+        self.assertRegex(message, "task history|support")
+        self.assertNotIn("use wait", message)
+        self.assertNotIn("new output", message)
         self.assertEqual(len(transport.requests), request_count)
 
     def test_definitely_rejected_create_cleans_reservation(self):
@@ -648,6 +654,48 @@ class PollingTests(unittest.TestCase):
                             ),
                         }
                     )
+
+    def test_malformed_https_result_urls_are_schema_errors(self):
+        malformed_urls = (
+            "https://[",
+            "https://:443/path",
+            "https://user@/path",
+            "https://user@example.com/path",
+            "https://result.example/a path/clip.mp4",
+            "https://result.example/path\nnext",
+            "https://result.example/path\x00next",
+            "https://result.example:abc/path",
+            "https://result.example:-1/path",
+            "https://result.example:0/path",
+            "https://result.example:70000/path",
+            "https://-bad.example/path",
+            "https://bad_.example/path",
+            "https://999.999.999.999/path",
+        )
+        for result_url in malformed_urls:
+            with self.subTest(result_url=repr(result_url)):
+                with self.assertRaisesRegex(kie_client.SchemaError, "HTTPS"):
+                    kie_client.parse_task_record(
+                        {
+                            "state": "success",
+                            "resultJson": json.dumps(
+                                {"resultUrls": [result_url]}
+                            ),
+                        }
+                    )
+
+    def test_valid_https_result_url_is_returned(self):
+        result_url = "https://cdn.example.com:443/video/clip.mp4?token=signed"
+
+        state, parsed_url = kie_client.parse_task_record(
+            {
+                "state": "success",
+                "resultJson": json.dumps({"resultUrls": [result_url]}),
+            }
+        )
+
+        self.assertEqual(state, "success")
+        self.assertEqual(parsed_url, result_url)
 
     def test_non_object_poll_response_is_schema_error(self):
         transport = FakeTransport([json_response(200, [])])
@@ -1187,7 +1235,12 @@ class EndToEndTests(unittest.TestCase):
             {"schemaVersion": 1, "taskId": "task_1", "state": "generating"},
         )
         transport = FakeTransport(
-            [task_record("success", result_json=json.dumps({"resultUrls": "file:///tmp/clip.mp4"}))]
+            [
+                task_record(
+                    "success",
+                    result_json=json.dumps({"resultUrls": ["https://["]}),
+                )
+            ]
         )
         stdout = io.StringIO()
         stderr = io.StringIO()

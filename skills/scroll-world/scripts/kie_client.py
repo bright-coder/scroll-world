@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import io
+import ipaddress
 import json
 import mimetypes
 import os
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 from contextlib import redirect_stderr
 from dataclasses import dataclass
@@ -288,13 +290,26 @@ def load_manifest(path: Path) -> dict[str, object] | None:
     return data
 
 
+def _existing_generation_message(
+    path: Path, manifest: Mapping[str, object] | None
+) -> str:
+    if manifest is not None and manifest.get("state") == "submission_uncertain":
+        return (
+            "task submission outcome is uncertain; retain this manifest and "
+            "investigate Kie task history or contact Kie support before authorizing "
+            f"any replacement: {path}"
+        )
+    return (
+        "existing generation reservation found; use wait or choose a new output: "
+        f"{path}"
+    )
+
+
 def ensure_new_generation(path: Path) -> None:
     """Reject generation when a saved task should be resumed with ``wait``."""
     manifest = load_manifest(path)
     if manifest is not None:
-        raise ValidationError(
-            f"existing generation reservation found; use wait or choose a new output: {path}"
-        )
+        raise ValidationError(_existing_generation_message(path, manifest))
 
 
 def create_task(
@@ -401,8 +416,12 @@ def reserve_generation(config: GenerationConfig) -> str:
     try:
         descriptor = os.open(manifest_path, flags, 0o600)
     except FileExistsError as error:
+        try:
+            manifest = load_manifest(manifest_path)
+        except ValidationError:
+            manifest = None
         raise ValidationError(
-            f"existing generation reservation found; use wait or choose a new output: {manifest_path}"
+            _existing_generation_message(manifest_path, manifest)
         ) from error
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as manifest_file:
@@ -554,6 +573,61 @@ def submit_generation(
     return task_id
 
 
+def _is_valid_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        pass
+    if len(hostname) > 253 or all(
+        character.isdigit() or character == "." for character in hostname
+    ):
+        return False
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    if ascii_hostname.endswith("."):
+        ascii_hostname = ascii_hostname[:-1]
+    labels = ascii_hostname.split(".")
+    return bool(labels) and all(
+        label
+        and len(label) <= 63
+        and not label.startswith("-")
+        and not label.endswith("-")
+        and all(character.isalnum() or character == "-" for character in label)
+        for label in labels
+    )
+
+
+def _is_valid_https_result_url(result_url: object) -> bool:
+    if not isinstance(result_url, str) or not result_url:
+        return False
+    if any(
+        character.isspace()
+        or unicodedata.category(character).startswith("C")
+        for character in result_url
+    ):
+        return False
+    try:
+        parsed = urlparse(result_url)
+        hostname = parsed.hostname
+        port = parsed.port
+        username = parsed.username
+        password = parsed.password
+    except (UnicodeError, ValueError):
+        return False
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.netloc)
+        and hostname is not None
+        and _is_valid_hostname(hostname)
+        and username is None
+        and password is None
+        and (port is None or 1 <= port <= 65535)
+    )
+
+
 def parse_task_record(data: Mapping[str, object]) -> tuple[str, str | None]:
     """Parse one documented Kie.ai task record into its state and result URL."""
     state = data.get("state")
@@ -574,10 +648,7 @@ def parse_task_record(data: Mapping[str, object]) -> tuple[str, str | None]:
     if not isinstance(result_urls, list) or not result_urls:
         raise SchemaError("resultUrls must be a non-empty list of HTTPS URLs")
     for result_url in result_urls:
-        if not isinstance(result_url, str) or result_url != result_url.strip():
-            raise SchemaError("resultUrls must be a non-empty list of HTTPS URLs")
-        parsed = urlparse(result_url)
-        if not result_url or parsed.scheme != "https" or not parsed.netloc:
+        if not _is_valid_https_result_url(result_url):
             raise SchemaError("resultUrls must be a non-empty list of HTTPS URLs")
     return state, result_urls[0]
 
