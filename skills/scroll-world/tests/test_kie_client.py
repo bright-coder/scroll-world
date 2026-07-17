@@ -1,10 +1,14 @@
 import os
+import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -120,6 +124,14 @@ def json_response(status, payload):
         status=status,
         headers={"content-type": "application/json"},
         body=json.dumps(payload).encode("utf-8"),
+    )
+
+
+def binary_response(status, body):
+    return kie_client.HttpResponse(
+        status=status,
+        headers={"content-type": "video/mp4"},
+        body=body,
     )
 
 
@@ -430,6 +442,292 @@ class PollingTests(unittest.TestCase):
 
         self.assertEqual(url, "https://result.example/clip.mp4")
         self.assertEqual(kie_client.load_manifest(manifest_path)["progress"], 45)
+
+
+class EndToEndTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def test_download_uses_part_file_then_replaces_output(self):
+        output = Path(self.tempdir.name) / "clip.mp4"
+        transport = FakeTransport([binary_response(200, b"fake-mp4")])
+        probed = []
+
+        kie_client.download_result(
+            "https://result/clip.mp4",
+            output,
+            transport,
+            probe=lambda path: probed.append(path) or {"codec_name": "h264"},
+        )
+
+        self.assertEqual(output.read_bytes(), b"fake-mp4")
+        self.assertEqual(probed, [Path(str(output) + ".part")])
+        self.assertFalse(Path(str(output) + ".part").exists())
+
+    def test_failed_probe_does_not_replace_existing_output(self):
+        output = Path(self.tempdir.name) / "clip.mp4"
+        output.write_bytes(b"known-good")
+        transport = FakeTransport([binary_response(200, b"invalid")])
+
+        def reject(_):
+            raise kie_client.MediaValidationError("not a video")
+
+        with self.assertRaisesRegex(kie_client.MediaValidationError, "not a video"):
+            kie_client.download_result(
+                "https://result/clip.mp4", output, transport, probe=reject
+            )
+
+        self.assertEqual(output.read_bytes(), b"known-good")
+
+    def test_probe_video_uses_ffprobe_and_returns_video_stream(self):
+        video = Path(self.tempdir.name) / "clip.mp4.part"
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append((command, kwargs))
+            return SimpleNamespace(
+                stdout=json.dumps(
+                    {"streams": [{"codec_name": "h264", "width": 1280}]}
+                )
+            )
+
+        stream = kie_client.probe_video(video, runner=runner)
+
+        self.assertEqual(stream["codec_name"], "h264")
+        self.assertEqual(calls[0][0][0], "ffprobe")
+        self.assertEqual(calls[0][0][-1], str(video))
+        self.assertEqual(
+            calls[0][1], {"check": True, "capture_output": True, "text": True}
+        )
+
+    def test_probe_video_rejects_missing_video_stream(self):
+        runner = lambda *_args, **_kwargs: SimpleNamespace(stdout='{"streams": []}')
+        with self.assertRaisesRegex(
+            kie_client.MediaValidationError, "video stream"
+        ):
+            kie_client.probe_video(Path("clip.mp4.part"), runner=runner)
+
+    def test_probe_video_wraps_runner_failure(self):
+        def runner(*_args, **_kwargs):
+            raise subprocess.CalledProcessError(1, ["ffprobe"])
+
+        with self.assertRaisesRegex(kie_client.MediaValidationError, "ffprobe"):
+            kie_client.probe_video(Path("clip.mp4.part"), runner=runner)
+
+    def test_wait_resumes_existing_task_without_create_request(self):
+        manifest = Path(self.tempdir.name) / "clip.mp4.kie.json"
+        output = Path(self.tempdir.name) / "clip.mp4"
+        kie_client.write_manifest_atomic(
+            manifest,
+            {
+                "schemaVersion": 1,
+                "taskId": "task_existing",
+                "state": "generating",
+                "output": str(output),
+            },
+        )
+        transport = FakeTransport(
+            [
+                task_record(
+                    "success",
+                    result_json=json.dumps(
+                        {"resultUrls": ["https://result/clip.mp4"]}
+                    ),
+                ),
+                binary_response(200, b"fake-mp4"),
+            ]
+        )
+
+        result = kie_client.run_wait(
+            manifest,
+            output,
+            "secret",
+            transport,
+            probe=lambda _: {"codec_name": "h264"},
+            sleeper=lambda _: None,
+        )
+
+        self.assertEqual(output.read_bytes(), b"fake-mp4")
+        self.assertEqual(result["taskId"], "task_existing")
+        self.assertFalse(
+            any("createTask" in item["url"] for item in transport.requests)
+        )
+        finalized = kie_client.load_manifest(manifest)
+        self.assertEqual(finalized["resultUrl"], "https://result/clip.mp4")
+        self.assertEqual(finalized["outputPath"], str(output))
+
+    def test_media_validation_failure_keeps_result_url_for_resume(self):
+        manifest = Path(self.tempdir.name) / "clip.mp4.kie.json"
+        output = Path(self.tempdir.name) / "clip.mp4"
+        kie_client.write_manifest_atomic(
+            manifest,
+            {"schemaVersion": 1, "taskId": "task_existing", "state": "generating"},
+        )
+        transport = FakeTransport(
+            [
+                task_record(
+                    "success",
+                    result_json=json.dumps(
+                        {"resultUrls": ["https://result/clip.mp4"]}
+                    ),
+                ),
+                binary_response(200, b"invalid"),
+            ]
+        )
+
+        def reject(_):
+            raise kie_client.MediaValidationError("not a video")
+
+        with self.assertRaises(kie_client.MediaValidationError):
+            kie_client.run_wait(
+                manifest,
+                output,
+                "secret",
+                transport,
+                probe=reject,
+                sleeper=lambda _: None,
+            )
+
+        saved = kie_client.load_manifest(manifest)
+        self.assertEqual(saved["state"], "success")
+        self.assertEqual(saved["resultUrl"], "https://result/clip.mp4")
+        self.assertFalse(output.exists())
+
+    def test_generate_uploads_submits_once_waits_downloads_and_finalizes(self):
+        config = replace(make_config(), output=Path(self.tempdir.name) / "clip.mp4")
+        transport = FakeTransport(
+            [
+                json_response(
+                    200,
+                    {
+                        "success": True,
+                        "code": 200,
+                        "data": {"downloadUrl": "https://files/start.png"},
+                    },
+                ),
+                json_response(
+                    200, {"code": 200, "data": {"taskId": "task_created"}}
+                ),
+                task_record(
+                    "success",
+                    result_json=json.dumps(
+                        {"resultUrls": ["https://result/clip.mp4"]}
+                    ),
+                ),
+                binary_response(200, b"fake-mp4"),
+            ]
+        )
+
+        result = kie_client.run_generate(
+            config,
+            "secret",
+            transport,
+            probe=lambda _: {"codec_name": "h264"},
+            sleeper=lambda _: None,
+        )
+
+        self.assertEqual(result["taskId"], "task_created")
+        self.assertEqual(config.output.read_bytes(), b"fake-mp4")
+        create_requests = [
+            request
+            for request in transport.requests
+            if "createTask" in request["url"]
+        ]
+        self.assertEqual(len(create_requests), 1)
+        manifest = kie_client.load_manifest(kie_client.manifest_path_for(config.output))
+        self.assertEqual(manifest["state"], "success")
+        self.assertEqual(manifest["resultUrl"], "https://result/clip.mp4")
+
+    def test_error_text_redacts_api_key(self):
+        text = kie_client.redact(
+            "Authorization: Bearer secret-value", "secret-value"
+        )
+        self.assertNotIn("secret-value", text)
+
+    def test_main_writes_one_json_result_and_progress_to_stderr(self):
+        config = make_config()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        result = {
+            "status": "success",
+            "taskId": "task_1",
+            "output": str(config.output),
+        }
+        argv = [
+            "generate-video",
+            "--prompt-file",
+            str(config.prompt_file),
+            "--start-image",
+            str(config.start_image),
+            "--output",
+            str(config.output),
+        ]
+
+        with mock.patch.dict(os.environ, {"KIE_API_KEY": "secret"}, clear=True):
+            with mock.patch.object(kie_client, "run_generate", return_value=result):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    status = kie_client.main(argv)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), result)
+        self.assertEqual(len(stdout.getvalue().strip().splitlines()), 1)
+        self.assertIn("Generating", stderr.getvalue())
+        self.assertNotIn("secret", stderr.getvalue())
+
+    def test_main_returns_distinct_status_and_redacts_expected_client_error(self):
+        config = make_config()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        argv = [
+            "generate-video",
+            "--prompt-file",
+            str(config.prompt_file),
+            "--start-image",
+            str(config.start_image),
+            "--output",
+            str(config.output),
+        ]
+
+        with mock.patch.dict(os.environ, {"KIE_API_KEY": "secret-value"}, clear=True):
+            with mock.patch.object(
+                kie_client,
+                "run_generate",
+                side_effect=kie_client.HttpError("failed with secret-value"),
+            ):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    status = kie_client.main(argv)
+
+        self.assertEqual(status, kie_client.CLIENT_ERROR_EXIT)
+        self.assertNotEqual(status, 0)
+        self.assertNotIn("secret-value", stdout.getvalue() + stderr.getvalue())
+        self.assertEqual(json.loads(stdout.getvalue())["status"], "error")
+
+    def test_main_reports_local_download_io_failure_as_client_error(self):
+        config = make_config()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        argv = [
+            "generate-video",
+            "--prompt-file",
+            str(config.prompt_file),
+            "--start-image",
+            str(config.start_image),
+            "--output",
+            str(config.output),
+        ]
+
+        with mock.patch.dict(os.environ, {"KIE_API_KEY": "secret"}, clear=True):
+            with mock.patch.object(
+                kie_client, "run_generate", side_effect=OSError("disk full")
+            ):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    status = kie_client.main(argv)
+
+        self.assertEqual(status, kie_client.CLIENT_ERROR_EXIT)
+        self.assertEqual(json.loads(stdout.getvalue())["error"], "disk full")
 
 
 # Keep this entry point at the end of the test file as later test classes are added.

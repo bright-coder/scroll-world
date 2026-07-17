@@ -3,3 +3,9 @@ node_modules/
 .gstack/
 .worktrees/
 .superpowers/
+.env
+.env.*
+!.env.example
+*.kie.json
+*.mp4.part
+skills/scroll-world/.smoke/

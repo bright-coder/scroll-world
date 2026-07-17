@@ -7,6 +7,8 @@ import json
 import mimetypes
 import os
 import random
+import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -28,6 +30,9 @@ TASK_INFO_URL = "https://api.kie.ai/api/v1/jobs/recordInfo"
 MANIFEST_SCHEMA_VERSION = 1
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 ACTIVE_STATES = {"waiting", "queuing", "generating"}
+VALIDATION_ERROR_EXIT = 2
+CLIENT_ERROR_EXIT = 3
+INTERRUPTED_EXIT = 130
 
 
 class ValidationError(ValueError):
@@ -48,6 +53,10 @@ class TaskFailedError(RuntimeError):
 
 class TaskTimeoutError(TimeoutError):
     """Raised when waiting for a Kie.ai task exceeds its configured deadline."""
+
+
+class MediaValidationError(RuntimeError):
+    """Raised when a downloaded result is not a valid video file."""
 
 
 @dataclass(frozen=True)
@@ -489,6 +498,239 @@ def wait_for_task(
         raise KeyboardInterrupt(f"interrupted while waiting; resume with {resume_command}")
 
 
+def probe_video(path: Path, runner=subprocess.run) -> dict[str, object]:
+    """Return metadata for the first video stream reported by FFprobe."""
+    try:
+        completed = runner(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,width,height,duration",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        payload = json.loads(completed.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+        raise MediaValidationError("ffprobe could not validate the download") from error
+    streams = payload.get("streams", []) if isinstance(payload, dict) else []
+    if (
+        not isinstance(streams, list)
+        or not streams
+        or not isinstance(streams[0], dict)
+        or not streams[0].get("codec_name")
+    ):
+        raise MediaValidationError("download did not contain a video stream")
+    return streams[0]
+
+
+def require_successful_http(response: HttpResponse) -> None:
+    """Raise a focused download error for a non-successful HTTP response."""
+    if 200 <= response.status < 300:
+        return
+    messages = {
+        400: "video download request was rejected",
+        401: "authentication failed while downloading video",
+        402: "payment or credits are required to download video",
+        404: "generated video was not found",
+    }
+    raise HttpError(
+        messages.get(
+            response.status,
+            f"video download failed with HTTP status {response.status}",
+        )
+    )
+
+
+def download_result(
+    url: str,
+    output: Path,
+    transport: UrllibTransport,
+    probe=probe_video,
+    sleeper=time.sleep,
+    randomizer=random.random,
+) -> dict[str, object]:
+    """Download, validate, and atomically install a generated video result."""
+    output = Path(output)
+    part = Path(str(output) + ".part")
+    response = request_with_retry(
+        lambda: transport.request("GET", url, {}, None),
+        sleeper=sleeper,
+        randomizer=randomizer,
+    )
+    require_successful_http(response)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(response.body)
+    stream = probe(part)
+    os.replace(part, output)
+    return stream
+
+
+def _finalize_manifest(
+    manifest_path: Path,
+    output: Path,
+    task_id: str,
+    result_url: str,
+) -> dict[str, object]:
+    manifest = load_manifest(manifest_path) or {}
+    timestamp = datetime.now(timezone.utc).isoformat()
+    manifest.update(
+        {
+            "schemaVersion": MANIFEST_SCHEMA_VERSION,
+            "taskId": task_id,
+            "state": "success",
+            "resultUrl": result_url,
+            "outputPath": str(output),
+            "updatedAt": timestamp,
+            "completedAt": timestamp,
+        }
+    )
+    write_manifest_atomic(manifest_path, manifest)
+    return {
+        "status": "success",
+        "taskId": task_id,
+        "resultUrl": result_url,
+        "output": str(output),
+        "manifest": str(manifest_path),
+    }
+
+
+def _persist_result_observation(
+    manifest_path: Path,
+    output: Path,
+    result_url: str,
+) -> None:
+    """Keep the provider result resumable even when local validation fails."""
+    manifest = load_manifest(manifest_path) or {}
+    manifest["state"] = "success"
+    manifest["resultUrl"] = result_url
+    manifest["outputPath"] = str(output)
+    manifest["updatedAt"] = datetime.now(timezone.utc).isoformat()
+    write_manifest_atomic(manifest_path, manifest)
+
+
+def run_generate(
+    config: GenerationConfig,
+    api_key: str,
+    transport: UrllibTransport,
+    probe=probe_video,
+    sleeper=time.sleep,
+    randomizer=random.random,
+    monotonic=time.monotonic,
+) -> dict[str, object]:
+    """Run a new generation from local validation through atomic download."""
+    validate_generation(config)
+    manifest_path = manifest_path_for(config.output)
+    ensure_new_generation(manifest_path)
+    first_url = upload_frame(
+        config.start_image,
+        api_key,
+        transport,
+        sleeper=sleeper,
+        randomizer=randomizer,
+    )
+    last_url = None
+    if config.end_image is not None:
+        last_url = upload_frame(
+            config.end_image,
+            api_key,
+            transport,
+            sleeper=sleeper,
+            randomizer=randomizer,
+        )
+    task_id = submit_generation(config, first_url, last_url, api_key, transport)
+    result_url = wait_for_task(
+        task_id,
+        api_key,
+        transport,
+        sleeper=sleeper,
+        randomizer=randomizer,
+        timeout_seconds=config.timeout_seconds,
+        manifest_path=manifest_path,
+        output_path=config.output,
+        monotonic=monotonic,
+    )
+    _persist_result_observation(manifest_path, config.output, result_url)
+    download_result(
+        result_url,
+        config.output,
+        transport,
+        probe=probe,
+        sleeper=sleeper,
+        randomizer=randomizer,
+    )
+    return _finalize_manifest(manifest_path, config.output, task_id, result_url)
+
+
+def run_wait(
+    manifest_path: Path,
+    output: Path,
+    api_key: str,
+    transport: UrllibTransport,
+    probe=probe_video,
+    sleeper=time.sleep,
+    randomizer=random.random,
+    timeout_seconds: int | None = None,
+    monotonic=time.monotonic,
+) -> dict[str, object]:
+    """Resume a persisted task without issuing another create request."""
+    manifest_path = Path(manifest_path)
+    output = Path(output)
+    manifest = load_manifest(manifest_path)
+    if manifest is None:
+        raise ValidationError(f"manifest does not exist: {manifest_path}")
+    task_id = manifest.get("taskId")
+    if not isinstance(task_id, str) or not task_id:
+        raise ValidationError(f"manifest does not contain a task ID: {manifest_path}")
+    if output.exists() and output.is_dir():
+        raise ValidationError("output must not be an existing directory")
+    if timeout_seconds is None:
+        parameters = manifest.get("parameters")
+        saved_timeout = (
+            parameters.get("timeoutSeconds")
+            if isinstance(parameters, dict)
+            else None
+        )
+        timeout_seconds = saved_timeout if isinstance(saved_timeout, int) else 900
+    if timeout_seconds <= 0:
+        raise ValidationError("timeout seconds must be positive")
+
+    result_url = wait_for_task(
+        task_id,
+        api_key,
+        transport,
+        sleeper=sleeper,
+        randomizer=randomizer,
+        timeout_seconds=timeout_seconds,
+        manifest_path=manifest_path,
+        output_path=output,
+        monotonic=monotonic,
+    )
+    _persist_result_observation(manifest_path, output, result_url)
+    download_result(
+        result_url,
+        output,
+        transport,
+        probe=probe,
+        sleeper=sleeper,
+        randomizer=randomizer,
+    )
+    return _finalize_manifest(manifest_path, output, task_id, result_url)
+
+
+def redact(text: str, api_key: str) -> str:
+    """Remove an API key from text destined for logs or machine output."""
+    return text.replace(api_key, "[REDACTED]") if api_key else text
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse Kie generation and resume commands into a validated CLI namespace."""
     parser = argparse.ArgumentParser(description="Generate or resume Kie.ai videos.")
@@ -530,9 +772,49 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Validate CLI input; request execution is added in the next client task."""
-    parse_args(argv)
-    return 0
+    """Run the requested workflow with JSON output and stable client exit codes."""
+    api_key = os.environ.get("KIE_API_KEY", "").strip()
+    try:
+        args = parse_args(argv)
+        api_key = require_api_key()
+        transport = UrllibTransport()
+        if args.command == "generate-video":
+            print(f"Generating video for {args.config.output}...", file=sys.stderr)
+            result = run_generate(args.config, api_key, transport)
+        else:
+            print(f"Waiting for task in {args.manifest}...", file=sys.stderr)
+            result = run_wait(
+                args.manifest,
+                args.output,
+                api_key,
+                transport,
+                timeout_seconds=args.timeout_seconds,
+            )
+        print("Video ready.", file=sys.stderr)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    except ValidationError as error:
+        message = redact(str(error), api_key)
+        print(f"Error: {message}", file=sys.stderr)
+        print(json.dumps({"status": "error", "error": message}, sort_keys=True))
+        return VALIDATION_ERROR_EXIT
+    except (
+        HttpError,
+        SchemaError,
+        TaskFailedError,
+        TaskTimeoutError,
+        MediaValidationError,
+        OSError,
+    ) as error:
+        message = redact(str(error), api_key)
+        print(f"Error: {message}", file=sys.stderr)
+        print(json.dumps({"status": "error", "error": message}, sort_keys=True))
+        return CLIENT_ERROR_EXIT
+    except KeyboardInterrupt as error:
+        message = redact(str(error) or "interrupted", api_key)
+        print(f"Error: {message}", file=sys.stderr)
+        print(json.dumps({"status": "error", "error": message}, sort_keys=True))
+        return INTERRUPTED_EXIT
 
 
 if __name__ == "__main__":
