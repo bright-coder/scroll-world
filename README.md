@@ -46,24 +46,32 @@ cp -R scroll-world/skills/scroll-world ~/.codex/skills/    # Codex
 
 ## Requirements
 
-- The [Higgsfield CLI](https://higgsfield.ai), authenticated (`higgsfield auth login`),
-  with credits.
+- Codex with its built-in `image_gen` tool for the default still-image workflow.
+- A [Kie.ai](https://kie.ai) API key in the project's ignored `.env.local`, plus enough
+  credits for `bytedance/seedance-2-fast` video generations.
 - `ffmpeg` / `ffprobe` for frame extraction and encoding.
-- Python 3 with Pillow (for the mobile portrait canvases; also the optional
-  transparent-scene knockout).
-- The [Codex CLI](https://github.com/openai/codex) (optional) — if present, the scene
-  stills can be generated through Codex's built-in `image_gen` (the same GPT Image
-  model), billed to a ChatGPT subscription instead of Higgsfield credits.
+- Python 3 (the Kie client uses only the standard library). Pillow is optional for
+  background knockout work.
+- Optional fallback: the [Higgsfield CLI](https://higgsfield.ai), authenticated with
+  credits.
+
+### Provider matrix
+
+| Role | Default | Fallback | Notes |
+|---|---|---|---|
+| Scene stills | Codex built-in `image_gen` | Higgsfield `gpt_image_2` | Copy approved stills into the project workspace and inspect every image. |
+| Video dives + connectors | Kie.ai `bytedance/seedance-2-fast` | Higgsfield frame-locking models | Kie runs at 720p and supports both `--start-image` and `--end-image`. |
+| Pipeline guide | `references/pipeline-kie.md` | `references/pipeline.md` | Do not mix video providers inside one chain. |
 
 ## What it does
 
-It leans on [Higgsfield](https://higgsfield.ai) for the art: cohesive isometric diorama
-scenes (GPT Image 2 — via Higgsfield, or the Codex CLI on a ChatGPT subscription) and the
-camera flights themselves (Seedance or Kling image-to-video — only models that can
-frame-lock a seam), scrubbed
+By default it uses Codex's built-in `image_gen` for cohesive isometric diorama stills and
+[Kie.ai](https://kie.ai) `bytedance/seedance-2-fast` for the camera flights. Higgsfield
+remains a complete fallback. Only video workflows that can frame-lock both ends of a seam
+are supported. The resulting clips are scrubbed
 by scroll position — the same technique behind Apple's scroll-through product pages. The
 camera genuinely moves; scroll only drives time. It's **framework-agnostic**: you get the
-Higgsfield pipeline, the prompt templates, and a portable vanilla-JS scrub engine that
+provider pipelines, the prompt templates, and a portable vanilla-JS scrub engine that
 drops into plain HTML, Next.js, Vue, or a Python-served page — nothing assumes a stack.
 
 When invoked, the skill:
@@ -88,8 +96,9 @@ When invoked, the skill:
 skills/scroll-world/
 ├── SKILL.md                    the procedure + the seam rule + gotchas
 └── references/
-    ├── prompts.md              intake checklist + every Higgsfield prompt template
-    ├── pipeline.md             copy-paste batch scripts (generate → frames → connectors → encode)
+    ├── prompts.md              intake checklist + still/video prompt templates
+    ├── pipeline-kie.md         default Codex stills + Kie video workflow
+    ├── pipeline.md             Higgsfield fallback workflow
     ├── scrub-engine.js         portable, config-driven scrub engine (blob-seek, lazy load, seam crossfade)
     ├── index-template.html     a minimal standalone page that mounts the engine
     └── knockout.py             background knockout for floating scenes
@@ -97,11 +106,10 @@ skills/scroll-world/
 
 ## Notes
 
-- Asset generation costs Higgsfield credits (~N image gens + ~2N-1 video gens for N
-  scenes; the mobile chain doubles the video gens) and takes a while — the skill runs
-  generations in the background and polls. Per-generation pricing isn't exposed by the
-  CLI, so the skill calibrates against your live balance and states the estimated total
-  before spending.
+- Video generation costs provider credits (~2N-1 video generations for N scenes; the
+  native mobile chain doubles them) and takes a while, so the skill obtains budget
+  approval, runs generations detached, and preserves resumable Kie manifests. Codex
+  stills use the user's Codex allowance; the Higgsfield fallback has its own credit cost.
 - The generated `.mp4`/`.webp` assets are produced per project; they're not shipped here.
 
 ## Star History
