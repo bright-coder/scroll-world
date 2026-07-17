@@ -150,7 +150,77 @@ class FakeTransport:
                 "timeout": timeout,
             }
         )
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+class RetryTests(unittest.TestCase):
+    def test_transport_wraps_url_and_timeout_failures_as_transient(self):
+        failures = (
+            kie_client.URLError("temporary DNS failure"),
+            TimeoutError("request timed out"),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                with mock.patch.object(kie_client, "urlopen", side_effect=failure):
+                    with self.assertRaisesRegex(
+                        kie_client.TransientNetworkError,
+                        "network error while contacting Kie.ai",
+                    ):
+                        kie_client.UrllibTransport().request(
+                            "GET", "https://example.invalid", {}
+                        )
+
+    def test_transient_network_error_is_retried_for_safe_operation(self):
+        attempts = []
+        sleeps = []
+
+        def operation():
+            attempts.append(None)
+            if len(attempts) == 1:
+                raise kie_client.TransientNetworkError("temporary timeout")
+            return json_response(200, {"ok": True})
+
+        response = kie_client.request_with_retry(
+            operation,
+            sleeper=sleeps.append,
+            randomizer=lambda: 0.0,
+            max_attempts=2,
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(sleeps, [3.0])
+
+    def test_transient_network_error_is_raised_after_bounded_attempts(self):
+        attempts = []
+
+        def operation():
+            attempts.append(None)
+            raise kie_client.TransientNetworkError("temporary timeout")
+
+        with self.assertRaisesRegex(
+            kie_client.TransientNetworkError, "temporary timeout"
+        ):
+            kie_client.request_with_retry(
+                operation,
+                sleeper=lambda _: None,
+                randomizer=lambda: 0.0,
+                max_attempts=3,
+            )
+
+        self.assertEqual(len(attempts), 3)
+
+    def test_non_positive_or_non_integer_max_attempts_are_rejected(self):
+        for max_attempts in (0, -1, True, 1.5, "4"):
+            with self.subTest(max_attempts=max_attempts):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    kie_client.request_with_retry(
+                        lambda: json_response(200, {}),
+                        max_attempts=max_attempts,
+                    )
 
 
 class UploadTests(unittest.TestCase):
@@ -275,6 +345,146 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(kie_client.ValidationError, "wait"):
             kie_client.ensure_new_generation(path)
 
+    def test_reservation_is_exclusive_and_blocks_without_task_id(self):
+        config = replace(make_config(), output=Path(self.tempdir.name) / "clip.mp4")
+
+        reservation_id = kie_client.reserve_generation(config)
+
+        manifest_path = kie_client.manifest_path_for(config.output)
+        manifest = kie_client.load_manifest(manifest_path)
+        self.assertEqual(manifest["reservationId"], reservation_id)
+        self.assertEqual(manifest["state"], "reserved")
+        self.assertIsNone(manifest["taskId"])
+        with self.assertRaisesRegex(kie_client.ValidationError, "reservation.*wait"):
+            kie_client.reserve_generation(config)
+
+    def test_run_generate_reserves_manifest_before_upload_and_cleans_definite_failure(self):
+        config = replace(make_config(), output=Path(self.tempdir.name) / "clip.mp4")
+        manifest_path = kie_client.manifest_path_for(config.output)
+
+        class RejectingUploadTransport:
+            def __init__(self):
+                self.requests = []
+                self.saw_reservation = False
+
+            def request(self, method, url, headers, body=None, timeout=60):
+                self.requests.append(url)
+                manifest = kie_client.load_manifest(manifest_path)
+                self.saw_reservation = (
+                    manifest is not None
+                    and manifest.get("state") == "reserved"
+                    and manifest.get("taskId") is None
+                )
+                return json_response(400, {"msg": "bad upload"})
+
+        transport = RejectingUploadTransport()
+        with self.assertRaisesRegex(kie_client.HttpError, "upload request"):
+            kie_client.run_generate(config, "secret", transport)
+
+        self.assertTrue(transport.saw_reservation)
+        self.assertEqual(len(transport.requests), 1)
+        self.assertFalse(manifest_path.exists())
+
+    def test_existing_reservation_blocks_run_before_any_upload(self):
+        config = replace(make_config(), output=Path(self.tempdir.name) / "clip.mp4")
+        manifest_path = kie_client.manifest_path_for(config.output)
+        kie_client.write_manifest_atomic(
+            manifest_path,
+            {
+                "schemaVersion": 1,
+                "reservationId": "another-process",
+                "state": "reserved",
+                "taskId": None,
+            },
+        )
+        transport = FakeTransport([])
+
+        with self.assertRaisesRegex(kie_client.ValidationError, "reservation.*wait"):
+            kie_client.run_generate(config, "secret", transport)
+
+        self.assertEqual(transport.requests, [])
+
+    def test_manifest_preflight_failure_prevents_upload_or_submission(self):
+        config = replace(make_config(), output=Path(self.tempdir.name) / "clip.mp4")
+        transport = FakeTransport([])
+
+        with mock.patch.object(
+            kie_client,
+            "reserve_generation",
+            side_effect=OSError("manifest destination is read-only"),
+        ):
+            with self.assertRaisesRegex(OSError, "read-only"):
+                kie_client.run_generate(config, "secret", transport)
+
+        self.assertEqual(transport.requests, [])
+
+    def test_ambiguous_create_failure_preserves_uncertain_reservation(self):
+        config = replace(make_config(), output=Path(self.tempdir.name) / "clip.mp4")
+        transport = FakeTransport(
+            [
+                json_response(
+                    200,
+                    {
+                        "success": True,
+                        "code": 200,
+                        "data": {"downloadUrl": "https://files/start.png"},
+                    },
+                ),
+                kie_client.TransientNetworkError("connection lost after send"),
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            kie_client.UncertainSubmissionError, "not retried.*duplicate spend"
+        ):
+            kie_client.run_generate(config, "secret", transport)
+
+        manifest_path = kie_client.manifest_path_for(config.output)
+        manifest = kie_client.load_manifest(manifest_path)
+        self.assertEqual(manifest["state"], "submission_uncertain")
+        self.assertIsNone(manifest["taskId"])
+        self.assertIn("not retried", manifest["lastError"])
+        request_count = len(transport.requests)
+        with self.assertRaisesRegex(kie_client.ValidationError, "reservation.*wait"):
+            kie_client.run_generate(config, "secret", transport)
+        self.assertEqual(len(transport.requests), request_count)
+
+    def test_definitely_rejected_create_cleans_reservation(self):
+        config = replace(make_config(), output=Path(self.tempdir.name) / "clip.mp4")
+        manifest_path = kie_client.manifest_path_for(config.output)
+
+        class InspectingTransport(FakeTransport):
+            def __init__(self, responses):
+                super().__init__(responses)
+                self.states_at_request = []
+
+            def request(self, *args, **kwargs):
+                manifest = kie_client.load_manifest(manifest_path)
+                self.states_at_request.append(
+                    manifest.get("state") if manifest is not None else None
+                )
+                return super().request(*args, **kwargs)
+
+        transport = InspectingTransport(
+            [
+                json_response(
+                    200,
+                    {
+                        "success": True,
+                        "code": 200,
+                        "data": {"downloadUrl": "https://files/start.png"},
+                    },
+                ),
+                json_response(400, {"msg": "bad task request"}),
+            ]
+        )
+
+        with self.assertRaisesRegex(kie_client.HttpError, "request was rejected"):
+            kie_client.run_generate(config, "secret", transport)
+
+        self.assertEqual(transport.states_at_request, ["reserved", "reserved"])
+        self.assertFalse(manifest_path.exists())
+
     def test_create_task_does_not_retry_a_retryable_failure(self):
         transport = FakeTransport([json_response(503, {"msg": "try later"})])
         with self.assertRaisesRegex(kie_client.HttpError, "not retried"):
@@ -282,6 +492,41 @@ class ManifestTests(unittest.TestCase):
                 {"model": kie_client.DEFAULT_MODEL}, "secret", transport
             )
         self.assertEqual(len(transport.requests), 1)
+
+    def test_create_task_does_not_retry_transient_network_failure(self):
+        class FailingTransport:
+            def __init__(self):
+                self.requests = 0
+
+            def request(self, *_args, **_kwargs):
+                self.requests += 1
+                raise kie_client.TransientNetworkError("temporary timeout")
+
+        transport = FailingTransport()
+        with self.assertRaisesRegex(
+            kie_client.HttpError, "not retried.*duplicate spend"
+        ):
+            kie_client.create_task(
+                {"model": kie_client.DEFAULT_MODEL}, "secret", transport
+            )
+        self.assertEqual(transport.requests, 1)
+
+    def test_create_task_has_focused_non_retryable_http_messages(self):
+        expectations = {
+            400: "request.*rejected",
+            401: "authentication",
+            402: "credits",
+        }
+        for status, message in expectations.items():
+            with self.subTest(status=status):
+                transport = FakeTransport([json_response(status, {})])
+                with self.assertRaisesRegex(
+                    kie_client.HttpError, rf"{message}.*not retried"
+                ):
+                    kie_client.create_task(
+                        {"model": kie_client.DEFAULT_MODEL}, "secret", transport
+                    )
+                self.assertEqual(len(transport.requests), 1)
 
     def test_submit_generation_writes_complete_waiting_manifest_immediately(self):
         config = replace(make_config(), output=Path(self.tempdir.name) / "clip.mp4")
@@ -325,7 +570,7 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(manifest["state"], "waiting")
         self.assertEqual(manifest["outputPath"], str(config.output))
         self.assertTrue(manifest["createdAt"].endswith("+00:00"))
-        self.assertEqual(manifest["createdAt"], manifest["updatedAt"])
+        self.assertGreaterEqual(manifest["updatedAt"], manifest["createdAt"])
         self.assertNotIn("secret-value", manifest_path.read_text(encoding="utf-8"))
 
 
@@ -379,10 +624,48 @@ class PollingTests(unittest.TestCase):
         with self.assertRaises(kie_client.SchemaError):
             kie_client.wait_for_task("task_1", "secret", transport)
 
+    def test_result_urls_must_be_a_non_empty_list_of_https_urls(self):
+        invalid_result_urls = (
+            "https://result.example/clip.mp4",
+            [],
+            [""],
+            ["   "],
+            ["http://result.example/clip.mp4"],
+            ["file:///tmp/clip.mp4"],
+            ["/tmp/clip.mp4"],
+            ["https:clip.mp4"],
+            ["https://result.example/clip.mp4", "file:///tmp/second.mp4"],
+            [123],
+        )
+        for result_urls in invalid_result_urls:
+            with self.subTest(result_urls=result_urls):
+                with self.assertRaisesRegex(kie_client.SchemaError, "HTTPS"):
+                    kie_client.parse_task_record(
+                        {
+                            "state": "success",
+                            "resultJson": json.dumps(
+                                {"resultUrls": result_urls}
+                            ),
+                        }
+                    )
+
     def test_non_object_poll_response_is_schema_error(self):
         transport = FakeTransport([json_response(200, [])])
         with self.assertRaises(kie_client.SchemaError):
             kie_client.wait_for_task("task_1", "secret", transport)
+
+    def test_poll_has_focused_non_retryable_http_messages(self):
+        expectations = {
+            400: "poll request.*rejected",
+            401: "authentication",
+            402: "credits",
+        }
+        for status, message in expectations.items():
+            with self.subTest(status=status):
+                transport = FakeTransport([json_response(status, {})])
+                with self.assertRaisesRegex(kie_client.HttpError, message):
+                    kie_client.wait_for_task("task_1", "secret", transport)
+                self.assertEqual(len(transport.requests), 1)
 
     def test_timeout_persists_progress_and_reports_resume_command(self):
         directory = Path(tempfile.mkdtemp())
@@ -390,7 +673,14 @@ class PollingTests(unittest.TestCase):
         output_path = directory / "clip.mp4"
         kie_client.write_manifest_atomic(manifest_path, {"taskId": "task_1"})
         transport = FakeTransport([task_record("generating", progress=45)])
-        times = iter((0.0, 0.0, 60.0))
+
+        class Clock:
+            now = 0.0
+
+            def __call__(self):
+                return self.now
+
+        clock = Clock()
 
         with self.assertRaisesRegex(
             kie_client.TaskTimeoutError,
@@ -400,16 +690,105 @@ class PollingTests(unittest.TestCase):
                 "task_1",
                 "secret",
                 transport,
-                sleeper=lambda _: None,
+                sleeper=lambda _: setattr(clock, "now", 60.0),
                 timeout_seconds=60,
                 manifest_path=manifest_path,
                 output_path=output_path,
-                monotonic=lambda: next(times),
+                monotonic=clock,
             )
 
         manifest = kie_client.load_manifest(manifest_path)
         self.assertEqual(manifest["state"], "generating")
         self.assertEqual(manifest["progress"], 45)
+
+    def test_poll_request_timeout_uses_remaining_budget_and_checks_after_request(self):
+        class Clock:
+            now = 100.0
+
+            def __call__(self):
+                return self.now
+
+        clock = Clock()
+
+        class SlowTransport(FakeTransport):
+            def request(self, *args, **kwargs):
+                response = super().request(*args, **kwargs)
+                clock.now += 11.0
+                return response
+
+        transport = SlowTransport([task_record("waiting")])
+        sleeps = []
+
+        with self.assertRaises(kie_client.TaskTimeoutError):
+            kie_client.wait_for_task(
+                "task_1",
+                "secret",
+                transport,
+                sleeper=sleeps.append,
+                timeout_seconds=10,
+                monotonic=clock,
+            )
+
+        self.assertEqual(transport.requests[0]["timeout"], 10.0)
+        self.assertEqual(sleeps, [])
+
+    def test_retry_sleep_is_capped_by_poll_deadline(self):
+        class Clock:
+            now = 0.0
+
+            def __call__(self):
+                return self.now
+
+        clock = Clock()
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock.now += seconds
+
+        transport = FakeTransport([json_response(503, {})])
+        with self.assertRaises(kie_client.TaskTimeoutError):
+            kie_client.wait_for_task(
+                "task_1",
+                "secret",
+                transport,
+                sleeper=sleep,
+                randomizer=lambda: 0.0,
+                timeout_seconds=2,
+                monotonic=clock,
+            )
+
+        self.assertEqual(sleeps, [2.0])
+        self.assertEqual(len(transport.requests), 1)
+
+    def test_active_poll_sleep_is_capped_by_poll_deadline(self):
+        class Clock:
+            now = 0.0
+
+            def __call__(self):
+                return self.now
+
+        clock = Clock()
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock.now += seconds
+
+        transport = FakeTransport([task_record("waiting")])
+        with self.assertRaises(kie_client.TaskTimeoutError):
+            kie_client.wait_for_task(
+                "task_1",
+                "secret",
+                transport,
+                sleeper=sleep,
+                randomizer=lambda: 0.0,
+                timeout_seconds=2,
+                monotonic=clock,
+            )
+
+        self.assertEqual(sleeps, [2.0])
+        self.assertEqual(len(transport.requests), 1)
 
     def test_missing_progress_retains_the_last_manifest_value(self):
         directory = Path(tempfile.mkdtemp())
@@ -799,6 +1178,37 @@ class EndToEndTests(unittest.TestCase):
 
         self.assertEqual(status, kie_client.CLIENT_ERROR_EXIT)
         self.assertEqual(json.loads(stdout.getvalue())["error"], "disk full")
+
+    def test_invalid_result_url_is_reported_as_clean_json_cli_error(self):
+        output = Path(self.tempdir.name) / "clip.mp4"
+        manifest = kie_client.manifest_path_for(output)
+        kie_client.write_manifest_atomic(
+            manifest,
+            {"schemaVersion": 1, "taskId": "task_1", "state": "generating"},
+        )
+        transport = FakeTransport(
+            [task_record("success", result_json=json.dumps({"resultUrls": "file:///tmp/clip.mp4"}))]
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with mock.patch.dict(os.environ, {"KIE_API_KEY": "secret"}, clear=True):
+            with mock.patch.object(kie_client, "UrllibTransport", return_value=transport):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    status = kie_client.main(
+                        [
+                            "wait",
+                            "--manifest",
+                            str(manifest),
+                            "--output",
+                            str(output),
+                        ]
+                    )
+
+        self.assertEqual(status, kie_client.CLIENT_ERROR_EXIT)
+        self.assertEqual(json.loads(stdout.getvalue())["status"], "error")
+        self.assertIn("HTTPS", stdout.getvalue())
+        self.assertNotIn("Traceback", stdout.getvalue() + stderr.getvalue())
 
 
 class DocumentationTests(unittest.TestCase):

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -43,6 +43,14 @@ class ValidationError(ValueError):
 
 class HttpError(RuntimeError):
     """Raised when a Kie.ai HTTP request cannot be completed."""
+
+
+class TransientNetworkError(HttpError):
+    """Raised when a safe Kie.ai request may succeed if retried."""
+
+
+class UncertainSubmissionError(HttpError):
+    """Raised when createTask may have accepted a paid task without returning its ID."""
 
 
 class SchemaError(RuntimeError):
@@ -93,8 +101,10 @@ class UrllibTransport:
                 headers=dict(error.headers.items()) if error.headers else {},
                 body=error.read(),
             )
-        except URLError as error:
-            raise HttpError("network error while contacting Kie.ai") from error
+        except (URLError, TimeoutError) as error:
+            raise TransientNetworkError(
+                "network error while contacting Kie.ai"
+            ) from error
 
 
 def encode_multipart_file(
@@ -134,14 +144,53 @@ def request_with_retry(
     sleeper=time.sleep,
     randomizer=random.random,
     max_attempts: int = 4,
+    deadline: float | None = None,
+    monotonic=time.monotonic,
+    deadline_error=None,
 ) -> HttpResponse:
     """Retry only transient HTTP responses with bounded exponential backoff."""
+    if (
+        not isinstance(max_attempts, int)
+        or isinstance(max_attempts, bool)
+        or max_attempts <= 0
+    ):
+        raise ValueError("max_attempts must be a positive integer")
+    def raise_for_deadline() -> None:
+        if deadline_error is None:
+            raise TaskTimeoutError("request deadline exceeded")
+        raise deadline_error()
+
+    def remaining_budget() -> float | None:
+        if deadline is None:
+            return None
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise_for_deadline()
+        return remaining
+
     for attempt in range(max_attempts):
-        response = operation()
+        remaining_budget()
+        try:
+            response = operation()
+        except TransientNetworkError:
+            remaining_budget()
+            if attempt == max_attempts - 1:
+                raise
+            delay = min(30.0, 3.0 * (2**attempt)) + randomizer()
+            remaining = remaining_budget()
+            if remaining is not None:
+                delay = min(delay, remaining)
+            sleeper(delay)
+            continue
+        remaining_budget()
         if response.status not in RETRYABLE_STATUS or attempt == max_attempts - 1:
             return response
-        sleeper(min(30.0, 3.0 * (2**attempt)) + randomizer())
-    raise AssertionError("max_attempts must be positive")
+        delay = min(30.0, 3.0 * (2**attempt)) + randomizer()
+        remaining = remaining_budget()
+        if remaining is not None:
+            delay = min(delay, remaining)
+        sleeper(delay)
+    raise AssertionError("unreachable")
 
 
 def _upload_error_message(status: int) -> str:
@@ -242,8 +291,10 @@ def load_manifest(path: Path) -> dict[str, object] | None:
 def ensure_new_generation(path: Path) -> None:
     """Reject generation when a saved task should be resumed with ``wait``."""
     manifest = load_manifest(path)
-    if manifest is not None and isinstance(manifest.get("taskId"), str) and manifest["taskId"]:
-        raise ValidationError(f"existing task manifest found; use wait: {path}")
+    if manifest is not None:
+        raise ValidationError(
+            f"existing generation reservation found; use wait or choose a new output: {path}"
+        )
 
 
 def create_task(
@@ -262,25 +313,41 @@ def create_task(
             },
             json.dumps(payload).encode("utf-8"),
         )
-    except HttpError as error:
-        raise HttpError(
-            "task creation was not retried to avoid duplicate spend"
+    except TransientNetworkError as error:
+        raise UncertainSubmissionError(
+            "task creation outcome is uncertain; it was not retried to avoid duplicate spend"
         ) from error
     if response.status != 200:
-        raise HttpError(
-            f"task creation failed with HTTP status {response.status}; "
-            "it was not retried to avoid duplicate spend"
+        messages = {
+            400: "task creation request was rejected",
+            401: "authentication failed while creating task",
+            402: "payment or credits are required to create task",
+        }
+        message = messages.get(
+            response.status,
+            f"task creation failed with HTTP status {response.status}",
         )
+        error_type = UncertainSubmissionError if response.status >= 500 else HttpError
+        raise error_type(f"{message}; it was not retried to avoid duplicate spend")
     try:
         response_payload = json.loads(response.body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise HttpError("task creation returned an invalid JSON response") from error
+        raise UncertainSubmissionError(
+            "task creation returned an invalid JSON response; "
+            "it was not retried to avoid duplicate spend"
+        ) from error
     if not isinstance(response_payload, dict):
-        raise HttpError("task creation returned an invalid response schema")
+        raise UncertainSubmissionError(
+            "task creation returned an invalid response schema; "
+            "it was not retried to avoid duplicate spend"
+        )
     data = response_payload.get("data")
     task_id = data.get("taskId") if isinstance(data, dict) else None
     if response_payload.get("code") != 200 or not isinstance(task_id, str) or not task_id:
-        raise HttpError("task creation returned an invalid response schema")
+        raise UncertainSubmissionError(
+            "task creation returned an invalid response schema; "
+            "it was not retried to avoid duplicate spend"
+        )
     return task_id
 
 
@@ -295,6 +362,75 @@ class GenerationConfig:
     resolution: str = "720p"
     duration: int = 15
     timeout_seconds: int = 900
+
+
+def _reservation_manifest(
+    config: GenerationConfig, reservation_id: str
+) -> dict[str, object]:
+    timestamp = datetime.now(timezone.utc).isoformat()
+    return {
+        "schemaVersion": MANIFEST_SCHEMA_VERSION,
+        "reservationId": reservation_id,
+        "model": config.model,
+        "parameters": {
+            "aspectRatio": config.aspect_ratio,
+            "duration": config.duration,
+            "resolution": config.resolution,
+            "timeoutSeconds": config.timeout_seconds,
+        },
+        "localInputs": {
+            "promptFile": str(config.prompt_file),
+            "startImage": str(config.start_image),
+            "endImage": str(config.end_image) if config.end_image else None,
+        },
+        "uploadedUrls": {"firstFrame": None, "lastFrame": None},
+        "taskId": None,
+        "state": "reserved",
+        "outputPath": str(config.output),
+        "createdAt": timestamp,
+        "updatedAt": timestamp,
+    }
+
+
+def reserve_generation(config: GenerationConfig) -> str:
+    """Exclusively reserve and preflight the sidecar before any remote operation."""
+    manifest_path = manifest_path_for(config.output)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    reservation_id = uuid.uuid4().hex
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        descriptor = os.open(manifest_path, flags, 0o600)
+    except FileExistsError as error:
+        raise ValidationError(
+            f"existing generation reservation found; use wait or choose a new output: {manifest_path}"
+        ) from error
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as manifest_file:
+            json.dump(
+                _reservation_manifest(config, reservation_id),
+                manifest_file,
+                indent=2,
+                sort_keys=True,
+            )
+            manifest_file.write("\n")
+            manifest_file.flush()
+            os.fsync(manifest_file.fileno())
+    except BaseException:
+        manifest_path.unlink(missing_ok=True)
+        raise
+    return reservation_id
+
+
+def release_generation_reservation(path: Path, reservation_id: str) -> None:
+    """Release only this process's definite pre-submission reservation."""
+    manifest = load_manifest(path)
+    if (
+        manifest is not None
+        and manifest.get("reservationId") == reservation_id
+        and manifest.get("state") == "reserved"
+        and manifest.get("taskId") is None
+    ):
+        Path(path).unlink(missing_ok=True)
 
 
 def require_api_key() -> str:
@@ -360,38 +496,61 @@ def submit_generation(
     last_url: str | None,
     api_key: str,
     transport: UrllibTransport,
+    reservation_id: str | None = None,
 ) -> str:
     """Submit uploaded inputs and immediately persist a resumable task manifest."""
     manifest_path = manifest_path_for(config.output)
-    ensure_new_generation(manifest_path)
-    task_id = create_task(
-        build_task_payload(config, first_url, last_url), api_key, transport
-    )
+    if reservation_id is None:
+        reservation_id = reserve_generation(config)
+    manifest = load_manifest(manifest_path)
+    if (
+        manifest is None
+        or manifest.get("reservationId") != reservation_id
+        or manifest.get("state") != "reserved"
+    ):
+        raise ValidationError(f"generation reservation is not owned: {manifest_path}")
+
+    submission_started = False
+    try:
+        payload = build_task_payload(config, first_url, last_url)
+        manifest["uploadedUrls"] = {
+            "firstFrame": first_url,
+            "lastFrame": last_url,
+        }
+        manifest["updatedAt"] = datetime.now(timezone.utc).isoformat()
+        write_manifest_atomic(manifest_path, manifest)
+        submission_started = True
+        task_id = create_task(payload, api_key, transport)
+    except UncertainSubmissionError as error:
+        manifest["state"] = "submission_uncertain"
+        manifest["lastError"] = str(error)
+        manifest["updatedAt"] = datetime.now(timezone.utc).isoformat()
+        write_manifest_atomic(manifest_path, manifest)
+        raise
+    except KeyboardInterrupt:
+        if submission_started:
+            manifest["state"] = "submission_uncertain"
+            manifest["lastError"] = (
+                "task creation was interrupted and was not retried to avoid duplicate spend"
+            )
+            manifest["updatedAt"] = datetime.now(timezone.utc).isoformat()
+            write_manifest_atomic(manifest_path, manifest)
+        else:
+            release_generation_reservation(manifest_path, reservation_id)
+        raise
+    except BaseException:
+        release_generation_reservation(manifest_path, reservation_id)
+        raise
+
     timestamp = datetime.now(timezone.utc).isoformat()
-    write_manifest_atomic(
-        manifest_path,
+    manifest.update(
         {
-            "schemaVersion": MANIFEST_SCHEMA_VERSION,
-            "model": config.model,
-            "parameters": {
-                "aspectRatio": config.aspect_ratio,
-                "duration": config.duration,
-                "resolution": config.resolution,
-                "timeoutSeconds": config.timeout_seconds,
-            },
-            "localInputs": {
-                "promptFile": str(config.prompt_file),
-                "startImage": str(config.start_image),
-                "endImage": str(config.end_image) if config.end_image else None,
-            },
-            "uploadedUrls": {"firstFrame": first_url, "lastFrame": last_url},
             "taskId": task_id,
             "state": "waiting",
-            "outputPath": str(config.output),
-            "createdAt": timestamp,
             "updatedAt": timestamp,
-        },
+        }
     )
+    write_manifest_atomic(manifest_path, manifest)
     return task_id
 
 
@@ -409,12 +568,18 @@ def parse_task_record(data: Mapping[str, object]) -> tuple[str, str | None]:
         if not isinstance(result_json, str):
             raise TypeError("resultJson must be a string")
         result = json.loads(result_json)
-        url = result["resultUrls"][0]
-        if not isinstance(url, str) or not url:
-            raise TypeError("result URL must be a non-empty string")
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
-        raise SchemaError("successful task did not contain resultUrls[0]") from error
-    return state, url
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise SchemaError("successful task did not contain valid result JSON") from error
+    result_urls = result.get("resultUrls") if isinstance(result, dict) else None
+    if not isinstance(result_urls, list) or not result_urls:
+        raise SchemaError("resultUrls must be a non-empty list of HTTPS URLs")
+    for result_url in result_urls:
+        if not isinstance(result_url, str) or result_url != result_url.strip():
+            raise SchemaError("resultUrls must be a non-empty list of HTTPS URLs")
+        parsed = urlparse(result_url)
+        if not result_url or parsed.scheme != "https" or not parsed.netloc:
+            raise SchemaError("resultUrls must be a non-empty list of HTTPS URLs")
+    return state, result_urls[0]
 
 
 def _resume_command(manifest_path: Path | None, output_path: Path | None) -> str:
@@ -461,23 +626,49 @@ def wait_for_task(
     deadline = monotonic() + timeout_seconds
     attempt = 0
     resume_command = _resume_command(manifest_path, output_path)
+
+    def timeout_error() -> TaskTimeoutError:
+        return TaskTimeoutError(
+            f"timed out waiting for task {task_id}; resume with {resume_command}"
+        )
+
+    def remaining_budget() -> float:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise timeout_error()
+        return remaining
+
+    def poll_once() -> HttpResponse:
+        request_timeout = min(60.0, remaining_budget())
+        return transport.request(
+            "GET",
+            f"{TASK_INFO_URL}?{urlencode({'taskId': task_id})}",
+            {"Authorization": f"Bearer {api_key}"},
+            timeout=request_timeout,
+        )
+
     try:
         while True:
-            if monotonic() >= deadline:
-                raise TaskTimeoutError(
-                    f"timed out waiting for task {task_id}; resume with {resume_command}"
-                )
             response = request_with_retry(
-                lambda: transport.request(
-                    "GET",
-                    f"{TASK_INFO_URL}?{urlencode({'taskId': task_id})}",
-                    {"Authorization": f"Bearer {api_key}"},
-                ),
+                poll_once,
                 sleeper=sleeper,
                 randomizer=randomizer,
+                deadline=deadline,
+                monotonic=monotonic,
+                deadline_error=timeout_error,
             )
             if response.status != 200:
-                raise HttpError(f"task polling failed with HTTP status {response.status}")
+                messages = {
+                    400: "task poll request was rejected",
+                    401: "authentication failed while polling task",
+                    402: "payment or credits are required to poll task",
+                }
+                raise HttpError(
+                    messages.get(
+                        response.status,
+                        f"task polling failed with HTTP status {response.status}",
+                    )
+                )
             try:
                 payload = json.loads(response.body.decode("utf-8"))
                 record = payload["data"] if isinstance(payload, dict) else None
@@ -494,7 +685,8 @@ def wait_for_task(
             state, result_url = parse_task_record(record)
             if result_url is not None:
                 return result_url
-            sleeper(min(30.0, 3.0 * (2 ** min(attempt, 4))) + randomizer())
+            delay = min(30.0, 3.0 * (2 ** min(attempt, 4))) + randomizer()
+            sleeper(min(delay, remaining_budget()))
             attempt += 1
     except KeyboardInterrupt:
         raise KeyboardInterrupt(f"interrupted while waiting; resume with {resume_command}")
@@ -631,24 +823,35 @@ def run_generate(
     """Run a new generation from local validation through atomic download."""
     validate_generation(config)
     manifest_path = manifest_path_for(config.output)
-    ensure_new_generation(manifest_path)
-    first_url = upload_frame(
-        config.start_image,
-        api_key,
-        transport,
-        sleeper=sleeper,
-        randomizer=randomizer,
-    )
-    last_url = None
-    if config.end_image is not None:
-        last_url = upload_frame(
-            config.end_image,
+    reservation_id = reserve_generation(config)
+    try:
+        first_url = upload_frame(
+            config.start_image,
             api_key,
             transport,
             sleeper=sleeper,
             randomizer=randomizer,
         )
-    task_id = submit_generation(config, first_url, last_url, api_key, transport)
+        last_url = None
+        if config.end_image is not None:
+            last_url = upload_frame(
+                config.end_image,
+                api_key,
+                transport,
+                sleeper=sleeper,
+                randomizer=randomizer,
+            )
+    except BaseException:
+        release_generation_reservation(manifest_path, reservation_id)
+        raise
+    task_id = submit_generation(
+        config,
+        first_url,
+        last_url,
+        api_key,
+        transport,
+        reservation_id=reservation_id,
+    )
     result_url = wait_for_task(
         task_id,
         api_key,
