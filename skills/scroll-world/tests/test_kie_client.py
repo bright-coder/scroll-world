@@ -399,6 +399,38 @@ class PollingTests(unittest.TestCase):
         self.assertEqual(manifest["state"], "generating")
         self.assertEqual(manifest["progress"], 45)
 
+    def test_missing_progress_retains_the_last_manifest_value(self):
+        directory = Path(tempfile.mkdtemp())
+        manifest_path = directory / "clip.mp4.kie.json"
+        kie_client.write_manifest_atomic(manifest_path, {"taskId": "task_1"})
+        success_without_progress = json_response(
+            200,
+            {
+                "code": 200,
+                "data": {
+                    "taskId": "task_1",
+                    "state": "success",
+                    "resultJson": json.dumps(
+                        {"resultUrls": ["https://result.example/clip.mp4"]}
+                    ),
+                },
+            },
+        )
+        transport = FakeTransport(
+            [task_record("generating", progress=45), success_without_progress]
+        )
+
+        url = kie_client.wait_for_task(
+            "task_1",
+            "secret",
+            transport,
+            sleeper=lambda _: None,
+            manifest_path=manifest_path,
+        )
+
+        self.assertEqual(url, "https://result.example/clip.mp4")
+        self.assertEqual(kie_client.load_manifest(manifest_path)["progress"], 45)
+
 
 # Keep this entry point at the end of the test file as later test classes are added.
 if __name__ == "__main__":

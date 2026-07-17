@@ -422,7 +422,8 @@ def _persist_task_observation(
     manifest = load_manifest(manifest_path) or {"taskId": task_id}
     manifest["taskId"] = task_id
     manifest["state"] = record.get("state")
-    manifest["progress"] = record.get("progress")
+    if "progress" in record:
+        manifest["progress"] = record["progress"]
     manifest["updatedAt"] = datetime.now(timezone.utc).isoformat()
     write_manifest_atomic(manifest_path, manifest)
 
@@ -482,7 +483,7 @@ def wait_for_task(
             state, result_url = parse_task_record(record)
             if result_url is not None:
                 return result_url
-            sleeper(min(30.0, 3.0 * (2**attempt)) + randomizer())
+            sleeper(min(30.0, 3.0 * (2 ** min(attempt, 4))) + randomizer())
             attempt += 1
     except KeyboardInterrupt:
         raise KeyboardInterrupt(f"interrupted while waiting; resume with {resume_command}")
