@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 import tempfile
 import unittest
@@ -112,6 +113,93 @@ class ValidationTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(args.config.model, "custom/model")
+
+
+def json_response(status, payload):
+    return kie_client.HttpResponse(
+        status=status,
+        headers={"content-type": "application/json"},
+        body=json.dumps(payload).encode("utf-8"),
+    )
+
+
+class FakeTransport:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+
+    def request(self, method, url, headers, body=None, timeout=60):
+        self.requests.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": dict(headers),
+                "body": body,
+                "timeout": timeout,
+            }
+        )
+        return self.responses.pop(0)
+
+
+class UploadTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.image_path = self.directory / "start.png"
+        self.image_path.write_bytes(b"png-frame")
+
+    def test_upload_returns_download_url_and_never_serializes_key(self):
+        transport = FakeTransport(
+            [
+                json_response(
+                    200,
+                    {
+                        "success": True,
+                        "code": 200,
+                        "data": {"downloadUrl": "https://tempfile.example/start.png"},
+                    },
+                )
+            ]
+        )
+        url = kie_client.upload_frame(
+            self.image_path, "secret-value", transport, sleeper=lambda _: None
+        )
+        self.assertEqual(url, "https://tempfile.example/start.png")
+        request = transport.requests[0]
+        self.assertEqual(request["url"], kie_client.UPLOAD_URL)
+        self.assertIn(b"Content-Disposition: form-data", request["body"])
+        self.assertNotIn(b"secret-value", request["body"])
+
+    def test_429_then_success_retries_once(self):
+        transport = FakeTransport(
+            [
+                json_response(429, {"msg": "rate limited"}),
+                json_response(
+                    200,
+                    {
+                        "success": True,
+                        "code": 200,
+                        "data": {"downloadUrl": "https://tempfile.example/a.png"},
+                    },
+                ),
+            ]
+        )
+        sleeps = []
+        url = kie_client.upload_frame(
+            self.image_path,
+            "secret",
+            transport,
+            sleeper=sleeps.append,
+            randomizer=lambda: 0.0,
+        )
+        self.assertEqual(url, "https://tempfile.example/a.png")
+        self.assertEqual(len(transport.requests), 2)
+        self.assertEqual(len(sleeps), 1)
+
+    def test_401_is_not_retried(self):
+        transport = FakeTransport([json_response(401, {"msg": "unauthorized"})])
+        with self.assertRaisesRegex(kie_client.HttpError, "authentication"):
+            kie_client.upload_frame(self.image_path, "secret", transport)
+        self.assertEqual(len(transport.requests), 1)
 
 
 # Keep this entry point at the end of the test file as later test classes are added.

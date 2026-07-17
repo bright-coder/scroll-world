@@ -2,19 +2,170 @@
 """Command-line contracts for Kie.ai video generation."""
 
 import argparse
+import hashlib
+import json
+import mimetypes
 import os
+import random
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
 DEFAULT_MODEL = "bytedance/seedance-2-fast"
 VALID_ASPECT_RATIOS = {"16:9", "9:16"}
 VALID_RESOLUTIONS = {"720p"}
+UPLOAD_URL = "https://kieai.redpandaai.co/api/file-stream-upload"
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
 class ValidationError(ValueError):
     """Raised when local generation inputs are invalid."""
+
+
+class HttpError(RuntimeError):
+    """Raised when a Kie.ai HTTP request cannot be completed."""
+
+
+@dataclass(frozen=True)
+class HttpResponse:
+    status: int
+    headers: Mapping[str, str]
+    body: bytes
+
+
+class UrllibTransport:
+    """Small urllib-based HTTP transport with an injectable test boundary."""
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        headers: Mapping[str, str],
+        body: bytes | None = None,
+        timeout: int = 60,
+    ) -> HttpResponse:
+        request = Request(url, data=body, headers=dict(headers), method=method)
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                return HttpResponse(
+                    status=response.status,
+                    headers=dict(response.headers.items()),
+                    body=response.read(),
+                )
+        except HTTPError as error:
+            return HttpResponse(
+                status=error.code,
+                headers=dict(error.headers.items()) if error.headers else {},
+                body=error.read(),
+            )
+        except URLError as error:
+            raise HttpError("network error while contacting Kie.ai") from error
+
+
+def encode_multipart_file(
+    path: Path, upload_path: str = "images/scroll-world"
+) -> tuple[str, bytes]:
+    """Encode a frame upload without including credentials in the body."""
+    contents = path.read_bytes()
+    digest = hashlib.sha256(contents).hexdigest()[:12]
+    remote_name = f"{path.stem}-{digest}{path.suffix.lower()}"
+    boundary = f"----scrollworld-{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+    for name, value in (("uploadPath", upload_path), ("fileName", remote_name)):
+        chunks.extend(
+            (
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+                value.encode(),
+                b"\r\n",
+            )
+        )
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    chunks.extend(
+        (
+            f"--{boundary}\r\n".encode(),
+            f'Content-Disposition: form-data; name="file"; filename="{remote_name}"\r\n'.encode(),
+            f"Content-Type: {mime}\r\n\r\n".encode(),
+            contents,
+            b"\r\n",
+            f"--{boundary}--\r\n".encode(),
+        )
+    )
+    return boundary, b"".join(chunks)
+
+
+def request_with_retry(
+    operation,
+    sleeper=time.sleep,
+    randomizer=random.random,
+    max_attempts: int = 4,
+) -> HttpResponse:
+    """Retry only transient HTTP responses with bounded exponential backoff."""
+    for attempt in range(max_attempts):
+        response = operation()
+        if response.status not in RETRYABLE_STATUS or attempt == max_attempts - 1:
+            return response
+        sleeper(min(30.0, 3.0 * (2**attempt)) + randomizer())
+    raise AssertionError("max_attempts must be positive")
+
+
+def _upload_error_message(status: int) -> str:
+    messages = {
+        400: "upload request was rejected",
+        401: "authentication failed while uploading frame",
+        402: "payment or credits are required to upload frame",
+    }
+    return messages.get(status, f"frame upload failed with HTTP status {status}")
+
+
+def upload_frame(
+    path: Path,
+    api_key: str,
+    transport: UrllibTransport,
+    sleeper=time.sleep,
+    randomizer=random.random,
+) -> str:
+    """Upload one local frame and return Kie.ai's temporary download URL."""
+    _require_regular_file(path, "frame")
+    if not api_key:
+        raise ValidationError("KIE_API_KEY must be set in the environment")
+    boundary, body = encode_multipart_file(path)
+    response = request_with_retry(
+        lambda: transport.request(
+            "POST",
+            UPLOAD_URL,
+            {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            body,
+        ),
+        sleeper=sleeper,
+        randomizer=randomizer,
+    )
+    if response.status != 200:
+        raise HttpError(_upload_error_message(response.status))
+    try:
+        payload = json.loads(response.body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HttpError("frame upload returned an invalid JSON response") from error
+    if not isinstance(payload, dict):
+        raise HttpError("frame upload returned an invalid response schema")
+    data = payload.get("data")
+    download_url = data.get("downloadUrl") if isinstance(data, dict) else None
+    if (
+        payload.get("success") is not True
+        or payload.get("code") != 200
+        or not isinstance(download_url, str)
+        or not download_url
+    ):
+        raise HttpError("frame upload returned an invalid response schema")
+    return download_url
 
 
 @dataclass(frozen=True)
