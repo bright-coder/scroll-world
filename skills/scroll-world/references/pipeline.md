@@ -1,3 +1,5 @@
+# Higgsfield fallback pipeline
+
 # Pipeline: copy-paste scripts (bash 3.2 safe)
 
 Set these once. `NAMES` is the ordered section ids; the last is the hero/finale.

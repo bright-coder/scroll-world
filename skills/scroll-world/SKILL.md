@@ -2,12 +2,13 @@
 name: scroll-world
 description: >
   Build an immersive scroll-scrubbed "fly through the world" landing page for any
-  industry or brand using Higgsfield. As the visitor scrolls, a pre-rendered camera
+  industry or brand using Codex image generation and Kie.ai video by default, with a
+  Higgsfield fallback. As the visitor scrolls, a pre-rendered camera
   flies from outside each scene into its interior, then flows on to the next scene
   with NO cuts — one continuous connected flight (Emons-style isometric diorama world,
   or any art direction you pick). The skill interviews the user for the topic, the
   story beats/sections, and brand kit, then generates cohesive scenes + seamless camera
-  clips with Higgsfield and wires a portable, framework-agnostic scroll-scrub engine.
+  clips and wires a portable, framework-agnostic scroll-scrub engine.
   Use when the user wants a "3D world" / "browse-through-the-industry" hero, a scroll
   cinematic, a diorama landing, or to turn a business into a scrollable world.
 allowed-tools: Bash, Read, Write, Edit, AskUserQuestion, Skill
@@ -17,7 +18,7 @@ allowed-tools: Bash, Read, Write, Edit, AskUserQuestion, Skill
 
 Produces a landing page where **scroll drives a camera**: it dives from outside a scene
 into its interior, then flies out and into the next scene, continuously, with no visible
-cuts. The visuals are AI-generated (Higgsfield); the page just scrubs pre-rendered video
+cuts. The visuals are AI-generated; the page just scrubs pre-rendered video
 by scroll position. This is the same technique behind Apple's scroll-through product
 pages — the camera genuinely moves, scroll only drives time.
 
@@ -33,33 +34,43 @@ connector. Getting this wrong is the single most common failure and produces a v
 Do not assume a frontend framework. The scrub engine in `references/scrub-engine.js` is
 self-contained vanilla JS (it builds its own DOM + injects its own CSS into a container
 you give it), so it drops into plain HTML, Next.js, Vue, a Python-served page, anything.
-The value of this skill is the Higgsfield pipeline, the prompts, and the seam method —
+The value of this skill is the provider pipelines, the prompts, and the seam method —
 not the framework.
 
 ---
 
 ## Step 0 — Bootstrap
 
-1. **Higgsfield CLI.** If `higgsfield` is not on `$PATH`, install per the
-   `higgsfield-generate` skill. If `higgsfield workspace list` fails auth, ask the user
-   to run `higgsfield auth login` (interactive OAuth — you cannot run it) and, if needed,
-   `higgsfield workspace set <id>`. Confirm there are enough credits: a full run is
-   roughly `N` image gens + `(2N-1)` video gens.
-2. **ffmpeg / ffprobe** on `$PATH` (frame extraction + encoding).
-3. **An image tool** for background knockout if you want floating scenes: PIL
+1. **Select the default route.** Unless the user explicitly chose the fallback, use:
+
+   ```bash
+   STILLS_SOURCE=codex
+   MEDIA_PROVIDER=kie
+   KIE_MODEL=${KIE_MODEL:-bytedance/seedance-2-fast}
+   ```
+
+   Codex default stills: built-in `image_gen`, copied into the project workspace.
+   Default video provider: Kie.ai `bytedance/seedance-2-fast`.
+   Fallback video provider: Higgsfield [`pipeline.md`](references/pipeline.md).
+   An existing user-approved `KIE_MODEL` environment override is authoritative; do not
+   silently replace it with the default.
+2. **Kie credential and credits.** Source `KIE_API_KEY` from the project's ignored
+   `.env.local` (never pass it as an argument, print it, or commit it). Use the bundled
+   `scripts/kie_client.py`; it needs Python 3 and no third-party package. A desktop
+   architecture-B run is `N + (N-1)` paid videos, and native mobile doubles that. State
+   the estimate with re-roll headroom and obtain approval before any submission.
+3. **ffmpeg / ffprobe** on `$PATH` (canvas normalization, rendered-frame extraction,
+   download validation, audio removal, and scrub-friendly encoding).
+4. **An image tool** for background knockout if you want floating scenes: PIL
    (`python3 -c "import PIL"`), or `cwebp`/`sips`. Optional — see Step 3.
-4. **(Optional) Codex CLI** — if `codex` is on `$PATH` (≥ 0.125) and
-   `codex login status` reports a ChatGPT login, the scene stills can be generated
-   through Codex's built-in `image_gen` (the same gpt-image-2 model) billed to the
-   user's ChatGPT subscription instead of Higgsfield credits — offer it at
-   Step 1.6, command in Step 2. Absence just removes the option.
-5. Caveats: macOS ships **bash 3.2** (no `declare -A`); don't use associative arrays in
-   scripts. Higgsfield generations take **3–8 min each** — always run them detached
-   (background) and poll, never a foreground blocking call. Reference-by-job-UUID is
-   rejected by media flags — pass **local file paths** to `--image/--start-image/--end-image`.
-   Video models differ in accepted params (e.g. Kling has no `--resolution`) and in whether
-   they support start/end-image conditioning at all — before batching, confirm the chosen
-   model's schema with `higgsfield model get <job_type>` and see the Step 4 model table.
+5. **Higgsfield fallback only.** If Kie is unavailable or the user chooses Higgsfield,
+   follow `references/pipeline.md` end-to-end. Do not mix providers within a video chain.
+   Authenticate the CLI and confirm its credits before falling back.
+6. Caveats: macOS ships **bash 3.2** (no `declare -A`); don't use associative arrays.
+   Video generations take minutes — always run them detached and poll. The Kie client
+   accepts local files, uploads them to temporary URLs, persists an output-sidecar
+   manifest, and downloads the result. Preserve that manifest and use `wait --manifest`
+   after a timeout or interruption; never resubmit blindly and risk duplicate spend.
 
 ---
 
@@ -98,60 +109,44 @@ default. Cover:
    two-option choice (`AskUserQuestion` in Claude Code; a plain question elsewhere):
    *"Want a mobile-optimized version too? The mobile version is a second camera chain
    rendered natively in **9:16 portrait** — composed for phones, not a crop of the
-   landscape film — which roughly doubles the Higgsfield credit spend (state the
+   landscape film — which roughly doubles the video-provider credit spend (state the
    estimated number)."*
    Options: "Desktop only" / "Desktop + mobile (native 9:16 — ~2× credits)". The
    credit cost must be stated to the user, not just implied.
    What the answer gates:
    - **Yes** → render the parallel 9:16 portrait chain and ship it as the mobile variants
-     (Step 6 / pipeline.md §6b): portrait start canvases → 9:16 dives + connectors
+     (Step 6 / pipeline-kie.md §6): portrait start canvases → 9:16 dives + connectors
      frame-locked against their own renders → 720-wide `-m.mp4` encodes → `stillMobile`
      portrait posters. Wire `clipMobile`/`connectorsMobile`/`stillMobile` (Step 7); run
      the full mobile QA (Step 8). Budget ~2N-1 extra video gens + NSFW re-rolls.
      **Never ship the centre-crop as the mobile version by default** — if credits can't
-     cover the portrait chain, say so and offer the crop encodes (pipeline.md §6) as an
+     cover the portrait chain, say so and offer crop encodes as an
      explicitly-labelled stopgap the user must approve.
    - **No** → skip the mobile encodes and wiring entirely. The engine's phone hardening
      (seek-coalescing, iOS priming, safe-area CSS) is always on regardless — that's not
      a "mobile version," it's just the page not breaking when a phone visits — so a
      desktop-only build still degrades gracefully.
 
-6. **Budget — engines shown by cost, decided before anything renders.** Present the
-   render tiers (`AskUserQuestion`), then compute and state the estimated total for
-   the user's N scenes — `N stills + (2N−1) videos [videos ×2 if mobile] + ~15%
-   re-roll headroom` — and get a go before generating.
-   - **Video tier** (roster only — every option frame-locks seams, Step 4):
+6. **Budget — decide before anything renders.** Default to Codex stills plus Kie video,
+   then compute and state the user's total: Codex allowance for `N` stills;
+   `N + (N-1)` paid Kie videos for architecture B or `N` for architecture A; double the
+   video count if native mobile is approved; add ~15% re-roll headroom. Pricing and plans
+   change, so use the user's current provider estimate rather than inventing a per-clip
+   price. Warn whenever the estimate exceeds ~70% of the available credit balance, and
+   get an explicit go before generating.
+   - **Default video model:** `bytedance/seedance-2-fast` at 720p through Kie. Respect an
+     already approved `KIE_MODEL` override. If the user proposes another override, confirm
+     it accepts both first and last frames before using architecture B.
+   - **Default stills source:** Codex's built-in `image_gen`, charged to the user's Codex
+     allowance. Copy every output into the project workspace. Use one source and one
+     byte-identical style preamble for all stills; mixing generators reads as style drift.
+   - **Fallback:** Higgsfield remains available with its own still/video credits and model
+     roster. If selected, use `references/pipeline.md` and its calibration instructions
+     for the whole chain.
 
-     | Tier | Model | Rough cost |
-     |---|---|---|
-     | Draft / previz | `seedance_2_0_mini` (720p) | ~¼ of Standard |
-     | Standard (default) | `seedance_2_0` (1080p) | baseline |
-     | Alternate | `kling3_0` (720p native) | ≈ Standard; different look + content filter |
-
-     Draft doubles as the previz path: run the whole chain cheap, approve the
-     journey, re-render final legs on Standard (pipeline.md Notes) — suggest it
-     unprompted when the balance reads tight.
-   - **Stills source** (only offer if the Codex CLI is present, Step 0.4):
-     Higgsfield `gpt_image_2` (spends credits) vs **Codex `image_gen`** — the same
-     gpt-image-2 model billed to the ChatGPT subscription (zero credits; counts
-     toward Codex usage limits; 1536×1024 output — exactly 3:2, slightly under
-     Higgsfield's 2k). Stills are plain PNGs handed to `--start-image`, so the
-     video chain is indifferent to their source. Command in Step 2. **One source
-     for all N stills of a build** — the two render with slightly different
-     character (verified: Codex runs warmer/lighter), and mixing sources across
-     scenes reads as style drift, same reason the video chain uses one model.
-   - **Calibrate costs, don't guess.** The CLI exposes no pricing and plans differ.
-     Run ONE still and ONE video first, diff `higgsfield workspace list` before/
-     after, extrapolate to the full run, and warn the user whenever the estimate
-     exceeds ~70% of the balance. (Observed on a plus plan, 2026-07: Standard
-     video ≈ 40–55 credits, still ≈ 15.) A real `not_enough_credits` mid-run is
-     recoverable (finished clips survive; resume after top-up) but ugly — the
-     whole point of this step is that the user decides *before* the spend.
-
-If the user names a video model outside the roster, honor it **only if it can
-frame-lock seams** (Step 4). This skill only ships seamless output, so a model that
-can't frame-lock is declined with a one-line why, not substituted in — use a roster
-model instead.
+If the user names a video model outside the documented defaults, honor it **only if it
+can frame-lock the required seams** (Step 4). This skill only ships seamless output, so
+decline a model that cannot accept the needed rendered boundary frames.
 
 Keep the scroll mechanic fixed (continuous fly-through) — that's the point of the skill.
 See `references/prompts.md` for the intake checklist and copy structure.
@@ -160,44 +155,36 @@ See `references/prompts.md` for the intake checklist and copy structure.
 
 ## Step 2 — Generate the scene stills
 
-One image per section, **all sharing the same style preamble** for cohesion. Default
-model **`gpt_image_2`** (crisp, great at isometric illustration; returns a solid/white
-background which is perfect for floating diorama "islands"). Use `nano_banana_2` only if
-the brief is character/cartoon-heavy (note: `nano_banana_2` is a CLI alias — it resolves
-to `nano_banana_pro`; it won't appear under that name in `higgsfield model list`).
+One image per section, **all sharing the same style preamble** for cohesion. With the
+default `STILLS_SOURCE=codex`, invoke Codex's built-in `image_gen` tool directly. Do not
+launch a nested Codex CLI process. After each generation, copy the resulting PNG from the
+tool's output location into the project workspace under `$WORK`, where the video pipeline
+can read it.
 
 Prompt shape (full templates in `references/prompts.md`):
 
 ```
 <STYLE PREAMBLE, identical every time>. On a plain solid <bg> background with a soft
-contact shadow. <PALETTE hexes>. No text, no letters, no logos, centered, 3:2.
+contact shadow. <PALETTE hexes>. No text, no letters, no logos, centered.
 Subject: <what is in THIS diorama>.
 ```
 
-- Run all N concurrently, detached. Command per scene:
-  `higgsfield generate create gpt_image_2 --prompt "$(cat scene_i.txt)" --aspect_ratio 3:2 --resolution 2k --quality high --wait --wait-timeout 15m --json > scene_i.json 2>scene_i.err`
-- Result URL is `.[]0.result_url` in the `--wait --json` output. `curl` it down.
-- **Codex stills variant** (if chosen at Step 1.6 — subscription-billed, zero
-  credits): same prompt files, same byte-identical preamble, generated by Codex's
-  built-in `image_gen`:
+- **Inspect every generated still before continuing.** Open each image at full size and
+  check subject, composition, palette, camera angle, lighting, legibility, accidental
+  text, and shared-world cohesion. Re-generate any failure before spending video credits.
+- **Normalize every approved still to the target video canvas.** Landscape stills become
+  exact 16:9 canvases and mobile stills become exact 9:16 canvases. Use FFmpeg scaling +
+  padding (or an intentional crop approved by the user), then inspect the normalized PNG
+  again. Never pass an arbitrary 3:2 output straight into a 16:9 video task.
+- Copy landscape inputs as `$WORK/start_<name>.png`. If native mobile was approved, make
+  separately composed portrait art and copy its normalized input as
+  `$WORK/start-mobile_<name>.png`; do not center-crop landscape art and call it mobile.
+- If image generation fails, re-run only that still. One source for the whole build and
+  the byte-identical style preamble are what keep the world cohesive.
+- With `STILLS_SOURCE=higgsfield`, follow the still-generation section in the fallback
+  `references/pipeline.md`, then apply the same inspection and canvas-normalization gates.
 
-  ```bash
-  codex exec -C "$WORK" -s workspace-write --skip-git-repo-check \
-    'Use the image generation tool ($imagegen) to generate: '"$(cat "$WORK/still_i.txt")"' Wide 3:2 landscape, high resolution. Save it as ./still_i.png. Do not do anything else.'
-  ```
-
-  Single-quote the `$imagegen` segment (the shell must not expand it); if editing
-  with reference images, the prompt goes BEFORE any `-i` flag (it's variadic).
-  ~1–3 min per image; run a few in parallel, not all N at once. Output lands at
-  1536×1024 (3:2) — fine for `--start-image` and posters. Everything downstream
-  (cohesion review, knockout, dives) is unchanged.
-- A generation may fail transiently (HTTP 503) — re-roll that one individually; don't
-  restart the batch.
-- **Review the stills before continuing.** They must read as one cohesive world (same
-  angle, palette, light). If one is off-style, regenerate it, optionally passing an
-  approved scene as `--image` to lock style.
-
-See `references/pipeline.md` for the exact batch script.
+See `references/pipeline-kie.md` for the default copy, normalization, and video commands.
 
 ---
 
@@ -220,38 +207,26 @@ pick by aesthetic.
 
 ### Video model — pick ONE for the whole chain
 
-**This skill only ships seamless output**, so the only usable models are ones that can
-frame-lock a seam: every chained clip must accept `--start-image`, and connectors also
-need `--end-image`. That capability — not preference — is the selection rule. Check any
-model with `higgsfield model get <job_type>` and **skip anything whose media inputs are
-reference-only** (no start/end image): it can only *condition* a generation, not
-*continue* a shot, so it physically can't hold a seam. Schemas below were confirmed
-against the CLI:
+**This skill only ships seamless output.** Every chained clip must accept a rendered
+`--start-image`, and architecture-B connectors must also accept a rendered
+`--end-image`. Conditioning on a loose reference image is not frame locking.
 
-| Model | start/end image | Notes |
-|---|---|---|
-| `seedance_2_0` (default) | ✓ / ✓ | Full chain (legs + connectors). `--mode std --resolution 1080p`. Its NSFW filter is the touchy one (see Gotchas). |
-| `kling3_0` | ✓ / ✓ | Full chain — tested: `--mode std --sound off --duration 5` with start+end images accepted, seams frame-lock cleanly. **No `--resolution` param** (don't pass one; `--mode std` returns **720p native** — encode what ffprobe reports, never upscale). Sound defaults **on** → `--sound off`. `--duration` default 5, try 10 for legs. Different content filter than Seedance — the sanctioned NSFW fallback. |
-| `seedance_2_0_mini` | ✓ / ✓ | Cheap draft tier that keeps frame-locking (720p). The previz tier: run the whole chain here first, then re-render final legs on the full model — still seamless, so it translates directly. |
-
-Those three are the roster — all do both architectures. (`kling3_0_turbo` also frame-locks
-via `--start-image`, but has no `--end-image`, so it's architecture-A-only and can't make
-connectors; it also takes a different flag set — no `--mode`, has `--resolution` — so it
-doesn't drop into the pipeline as-is. It's not in the default roster; only reach for it, and
-wire it by hand, if architecture A's sequential render time is a proven bottleneck and you've
-benchmarked it as actually faster.)
+| Route | Model | Start/end image | Notes |
+|---|---|---|---|
+| Default | Kie.ai `bytedance/seedance-2-fast` | ✓ / ✓ | 720p, 16:9 or 9:16, 15-second default; `scripts/kie_client.py` disables audio and persists a resumable manifest. |
+| Approved override | `$KIE_MODEL` | Verify ✓ / ✓ for architecture B | Preserve an already approved override; never silently reset it. |
+| Fallback | Higgsfield roster in `pipeline.md` | Model-dependent | Follow the fallback pipeline's exact per-model flags. |
 
 Rules:
-- **One model for all chained clips.** Each renderer has its own motion/color/grain
-  character; mixing models mid-chain keeps *position* continuity (frames still hand off)
-  but the render-character shift reads as a subtle pop. The one sanctioned exception is
-  the NSFW fallback for a single stubborn clip (Gotchas) — a slight character shift on
-  one 5s connector beats a missing connector.
-- Default to `seedance_2_0`; honor a user's stated preference **only if the model
-  qualifies** (frame-locking). If it doesn't, say so and use a supported model — never
-  ship a non-seamless build to satisfy a model request.
-- The pipeline scripts take the model as `$VMODEL` with per-model flags already cased
-  out (`references/pipeline.md`).
+- **One provider and one model for all chained clips.** Renderers have distinct motion,
+  color, and grain; mixing them mid-chain creates a character shift even if endpoint
+  pixels match.
+- Default to Kie.ai `bytedance/seedance-2-fast`. Use Higgsfield only when explicitly
+  selected or when Kie cannot be used, and then follow `references/pipeline.md` for the
+  whole asset run.
+- `references/pipeline-kie.md` is the executable default. It uses local frame paths,
+  720p, the exact `generate-video` / `wait --manifest` interface, and the approved
+  `KIE_MODEL` environment override.
 
 ### A) Continuous forward take — RECOMMENDED for grounded / realistic / walkthrough
 One camera that only ever glides **forward**, first scene through last, as a single take.
@@ -321,8 +296,9 @@ must be consistent in both directions (a seam that reads fine forward reads as a
 backward too if velocity flips).
 
 **For B**, one camera flight per scene: starts high/outside, descends into the interior,
-structure opens. Model: the chain model you picked above (default **`seedance_2_0`**),
-`--start-image = the scene still`.
+structure opens. Model: the chain model you picked above (default Kie.ai
+**`bytedance/seedance-2-fast`**), with `--start-image` set to the normalized 16:9 scene
+canvas.
 
 - Use the **solid-background still** (not the knocked-out transparent one) as the
   start image, so the video has a full frame.
@@ -330,12 +306,12 @@ structure opens. Model: the chain model you picked above (default **`seedance_2_
   at the whole <scene> from outside … descend and fly inside toward <focal point> … the
   roof/walls gently open to reveal the interior. <style>, smooth graceful slow motion.
   No text." (Template in `references/prompts.md`.)
-- Params (seedance): `--mode std --resolution 1080p --aspect_ratio 16:9 --duration 8`.
-  For Kling: drop `--resolution` (no such param), add `--sound off`, `--duration 10`.
-  Do **not** pass `--generate-audio` (it errors on seedance; audio is wasted anyway —
-  you'll mute).
-- Run concurrently, detached, then download each `.result_url`. Re-roll individual
-  failures. Keep the raw 1080p sources — you need their frames next.
+- Default Kie params are `--aspect-ratio 16:9 --resolution 720p --duration 15`; the client
+  sets audio off, downloads and validates the result, and saves
+  `<output>.kie.json`. Run concurrently with bounded parallelism and detached execution.
+  Resume an interrupted task with `wait --manifest`; never resubmit blindly.
+- Keep the downloaded 720p sources — their actual rendered frames are the only valid seam
+  inputs. Higgsfield fallback flags remain in `references/pipeline.md`.
 
 ---
 
@@ -350,7 +326,7 @@ flies from the end of scene i out and into the start of scene i+1. **Both of its
 endpoints must be the ACTUAL RENDERED FRAMES of the neighbouring clips — never the
 original diorama still.**
 
-Why: every Higgsfield generation renders slightly differently. If a connector *ends* on
+Why: every video generation renders slightly differently. If a connector *ends* on
 a fresh render of "the kitchen diorama," but the next dive clip *starts* on its own
 different render of that same diorama, the two won't match and you get a pop at the seam.
 The fix is to hand off the exact pixels:
@@ -371,24 +347,27 @@ ffmpeg -sseof -0.15 -i dive_i.mp4   -frames:v 1 -q:v 2 dive_i_last.png    # inte
 ffmpeg -ss 0      -i dive_{i+1}.mp4 -frames:v 1 -q:v 2 dive_next_first.png # establishing of i+1
 ```
 
-Generate the connector (`--duration 5` is plenty). Connectors need `--end-image`, so the
-model must accept it — any roster model does (`seedance_2_0`, `seedance_2_0_mini`,
-`kling3_0`):
+Generate the connector with the same model as the dives. Connectors need `--end-image`,
+so the selected model must accept it. The default executable command is:
 
 ```bash
-higgsfield generate create "$VMODEL" \
-  --prompt "$(cat connector_i.txt)" \
-  --start-image dive_i_last.png --end-image dive_next_first.png \
-  $VOPTS --aspect_ratio 16:9 --duration 5 --wait --json
-# seedance: VOPTS="--mode std --resolution 1080p"; kling3_0: VOPTS="--mode std --sound off"
+python3 "$SKILL/scripts/kie_client.py" generate-video \
+  --prompt-file "$WORK/conn_$index.txt" \
+  --start-image "$WORK/last_$previous.png" \
+  --end-image "$WORK/first_$next.png" \
+  --aspect-ratio 16:9 --resolution 720p --duration 15 \
+  --output "$WORK/conn_$index.mp4"
 ```
+
+Run it detached. On timeout or interruption, resume the output sidecar with
+`python3 "$SKILL/scripts/kie_client.py" wait --manifest "$WORK/conn_$index.mp4.kie.json" --output "$WORK/conn_$index.mp4"`.
 
 Connector prompt: "Single continuous camera move, no cuts. Pull up and back out of
 <scene i>, rise into the sky, glide across the connected miniature world, and arrive
 above <scene i+1>, beginning to descend toward it. Seamless flowing aerial transition.
 <style>. No text." (Template in `references/prompts.md`.)
 
-Insurance: Seedance lands *close* to the end-image but not always pixel-perfect, so the
+Insurance: the model may land *close* to the end-image rather than pixel-perfect, so the
 engine still applies a **short crossfade** (a few frames) at each seam. Frame-matched
 endpoints + a small crossfade = no visible cut. Never skip the actual-frame handoff and
 rely on the crossfade alone; a big content jump can't be hidden by a crossfade.
@@ -407,7 +386,8 @@ often gotten wrong:
    in-memory object URL** (blobs are always fully seekable). The engine does this.
    Because of it, you do **not** need all-intra video.
 2. **Don't shrink quality to get smooth seeks.** Encode at the **native resolution**
-   (1080p from Seedance — don't downscale), `crf ~20`, a **small GOP** (`-g 8`) rather
+   (720p from the default Kie model; fallback providers may differ), `crf ~20`, a
+   **small GOP** (`-g 8`) rather
    than all-intra (all-intra bloats an 8s clip to ~25 MB; GOP 8 is ~8 MB and scrubs
    fine via blob). Strip audio, add faststart, and a light `unsharp` counters video
    softness:
@@ -421,14 +401,14 @@ ffmpeg -i src.mp4 -an -vf "unsharp=5:5:0.8:5:5:0.0" \
 Encode all 2N-1 clips (dives + connectors) with the same settings for uniform quality.
 
 **Mobile encodes (only if the user opted in at Step 1.5).** The mobile version is
-the **native 9:16 portrait chain** (pipeline.md §6b): portrait renders of every dive and
+the **native 9:16 portrait chain** (`pipeline-kie.md` §6): portrait renders of every dive and
 connector, encoded **720 wide (`scale=720:-2`), `-g 4`** (more keyframes = cheaper seeks —
 phone decoders' seek cost scales with GOP length), crf 23 — wired as `clipMobile` /
 `connectorsMobile`, with each portrait dive's first frame extracted as the section's
 `stillMobile` poster (Step 7). The engine serves them automatically on phones and falls
-back to the desktop clip when absent. The 16:9 centre-crop `encm()` encodes
-(pipeline.md §6) are a **fallback only** — for when credits can't cover the portrait
-chain — and shipping them must be called out to the user, never silent. If the user chose
+back to the desktop clip when absent. A 16:9 centre-crop encode is a **fallback only** —
+for when credits cannot cover the portrait chain — and shipping it must be called out to
+the user, never silent. If the user chose
 desktop-only, skip this — the engine still hardens phone scrubbing regardless
 (seek-coalescing, iOS priming), so the page degrades gracefully rather than breaking.
 
@@ -506,7 +486,7 @@ is the thing most likely to be wrong:
     over the instant you scroll — no blank/black scene (the iOS priming fix). Test iOS Safari
     specifically; it's the one that goes blank if this regresses.
   - Verify the `-m.mp4` variant is actually served on mobile (Network panel), and the
-    heavy 1080p master on desktop. The mobile clips must be **natively portrait**
+    native landscape master on desktop. The mobile clips must be **natively portrait**
     (`videoWidth < videoHeight` — not a downscaled 16:9 file), and the `stillMobile`
     posters must be served and match each portrait clip's first frame (no
     landscape→portrait flash when the video paints).
@@ -531,13 +511,13 @@ is the thing most likely to be wrong:
 - **Frozen video / stuck at frame 0** → `seekable=[0,0]`; the host isn't serving byte
   ranges. Use blob URLs (engine does).
 - **Huge files** → you used all-intra. Use `-g 8` + blob instead.
-- **Soft / low quality** → you downscaled or over-compressed. Encode native 1080p,
-  crf ≤ 20, add `unsharp`. Video is inherently softer than the stills — keep the stills
-  as the lite fallback for max fidelity.
-- **Concurrent gens 503 / "not_enough_credits" race** → transient when many launch at
-  once; re-roll the individual failure, it's not really out of credits (verify with
-  `higgsfield workspace list`).
-- **NSFW false-positives (Seedance `status "nsfw"`)** → the video content filter flags
+- **Soft / low quality** → you downscaled or over-compressed. Encode the provider's native
+  resolution (720p for default Kie), crf ≤ 20, add `unsharp`. Video is inherently softer
+  than the stills — keep the stills as the lite fallback for max fidelity.
+- **Concurrent failures / credit errors** → verify the live provider balance and retry
+  only the individual task when it is safe. If a Kie task already has a manifest, resume
+  it with `wait --manifest`; do not create a duplicate paid task.
+- **Higgsfield fallback NSFW false-positives (Seedance `status "nsfw"`)** → its content filter flags
   perfectly innocuous clips, especially **bedroom, pool, spa/wellness** contexts and
   trigger words like "bed", "pool", "waterfall", "wine", "swim". It's partly the prompt
   wording and partly the reference frames. Fixes, in order: (1) re-roll — it's often
@@ -554,7 +534,7 @@ is the thing most likely to be wrong:
   wins cleanly (no specificity hacks). `--sw-ink` is your primary **text/heading** colour;
   the **accent** fills the primary button and active nav. For a dark theme, set `--sw-bg`
   dark and `--sw-ink` light — the copy scrim and title shadow follow `--sw-bg` automatically.
-- **Phone scrub stutters / freezes on a fast flick** → the 1080p master is too heavy for a
+- **Phone scrub stutters / freezes on a fast flick** → the landscape master is too heavy for a
   phone decoder and seeks pile up. Ship the `-m.mp4` mobile encodes (720p, `-g 4`) and wire
   `clipMobile`/`connectorsMobile` (Step 6/7). The engine already coalesces seeks; the lighter
   encode is the other half. Still choppy on a low-end device? Tighten GOP (`-g 2` / all-intra).
@@ -570,20 +550,21 @@ is the thing most likely to be wrong:
   bottom offset (`env(safe-area-inset-bottom)` + `dvh`); make sure the page's
   `<meta viewport>` includes `viewport-fit=cover` (the template does).
 - **Portrait crops the scene** → a 16:9 clip on a tall phone shows only its centre — which
-  is why the mobile version is the native 9:16 chain (§6b), never the crop. If you're seeing
+  is why the mobile version is the native 9:16 chain (Step 6), never the crop. If you're seeing
   this on a mobile build, either the crop fallback shipped (call it out to the user) or the
   9:16 encodes aren't actually being served (check `videoWidth < videoHeight`). Keeping each
   scene's focal subject centred (prompts.md) still matters for the desktop film itself.
-- **`--generate-audio` errors on seedance** → omit it; mute in HTML and `-an` on encode.
-- **Kling rejects your flags** → `kling3_0` has **no `--resolution` param** (don't pass
+- **Unexpected audio** → the Kie client requests no audio; still mute in HTML and use
+  `-an` on every final encode. In the Higgsfield fallback, omit unsupported audio flags.
+- **Higgsfield fallback Kling rejects your flags** → `kling3_0` has **no `--resolution` param** (don't pass
   one; encode at whatever native res ffprobe reports) and **sound defaults on** — pass
   `--sound off`. Duration default is 5; legs/dives want 10.
 - **Seam pop only where you "saved credits"** → you swapped models mid-chain, or used a
   start-image-only model where a connector needs an `--end-image`. One model for the whole
-  chain; the only cheap tier is `seedance_2_0_mini`, which keeps frame-locking so it stays
-  seamless. (Any model with reference-only inputs can't hold a seam at all — Step 4.)
-- **White-box scenes** → `gpt_image_2` returns a solid bg; either match the page bg to it
-  or knock it out (Step 3).
+  chain. In the Higgsfield fallback, `seedance_2_0_mini` is the cheap frame-locking tier.
+  Any model with reference-only inputs cannot hold a seam at all (Step 4).
+- **White-box scenes** → match the page background to the generated still or knock it out
+  (Step 3).
 - **bash 3.2** on macOS → no associative arrays in scripts.
 - **Connector grabs the wrong scene's frames** (or errors on a frame that doesn't exist
   yet) → the array loop ran in **zsh** (macOS default interactive shell), where arrays are
@@ -594,8 +575,11 @@ is the thing most likely to be wrong:
 
 - `references/prompts.md` — the intake checklist, style-preamble pattern, and every
   prompt template (scene still, dive, connector) with fill-in slots.
-- `references/pipeline.md` — copy-paste batch scripts for the whole run (generate →
-  extract frames → connectors → encode → mobile encode), bash-3.2-safe.
+- `references/pipeline-kie.md` — default Codex `image_gen` stills + Kie.ai
+  `bytedance/seedance-2-fast` workflow (normalize → generate → extract rendered frames →
+  connectors → resume → encode → native mobile chain).
+- `references/pipeline.md` — Higgsfield fallback batch scripts, bash-3.2-safe. Use it
+  end-to-end rather than mixing providers inside a chain.
 - `references/scrub-engine.js` — the portable, config-driven scrub engine (builds DOM +
   injects CSS; blob-seek, lazy load, seam crossfade, copy, route rail, reduced-motion, and
   phone hardening: mobile encodes, seek-coalescing, iOS priming, safe-area, no-jump resize).
