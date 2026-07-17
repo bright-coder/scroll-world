@@ -317,6 +317,89 @@ class ManifestTests(unittest.TestCase):
         self.assertNotIn("secret-value", manifest_path.read_text(encoding="utf-8"))
 
 
+def task_record(state, progress=0, result_json=None, fail_code="", fail_msg=""):
+    data = {
+        "taskId": "task_1",
+        "state": state,
+        "progress": progress,
+        "resultJson": result_json,
+        "failCode": fail_code,
+        "failMsg": fail_msg,
+    }
+    return json_response(200, {"code": 200, "msg": "success", "data": data})
+
+
+class PollingTests(unittest.TestCase):
+    def test_waiting_generating_success_returns_nested_result_url(self):
+        transport = FakeTransport(
+            [
+                task_record("waiting"),
+                task_record("generating", progress=70),
+                task_record(
+                    "success",
+                    result_json=json.dumps(
+                        {"resultUrls": ["https://result.example/clip.mp4"]}
+                    ),
+                ),
+            ]
+        )
+        url = kie_client.wait_for_task(
+            "task_1",
+            "secret",
+            transport,
+            sleeper=lambda _: None,
+            randomizer=lambda: 0.0,
+            timeout_seconds=60,
+        )
+        self.assertEqual(url, "https://result.example/clip.mp4")
+
+    def test_fail_state_reports_provider_message(self):
+        transport = FakeTransport(
+            [task_record("fail", fail_code="CONTENT", fail_msg="input rejected")]
+        )
+        with self.assertRaisesRegex(
+            kie_client.TaskFailedError, "CONTENT.*input rejected"
+        ):
+            kie_client.wait_for_task("task_1", "secret", transport)
+
+    def test_malformed_result_json_is_schema_error(self):
+        transport = FakeTransport([task_record("success", result_json="not-json")])
+        with self.assertRaises(kie_client.SchemaError):
+            kie_client.wait_for_task("task_1", "secret", transport)
+
+    def test_non_object_poll_response_is_schema_error(self):
+        transport = FakeTransport([json_response(200, [])])
+        with self.assertRaises(kie_client.SchemaError):
+            kie_client.wait_for_task("task_1", "secret", transport)
+
+    def test_timeout_persists_progress_and_reports_resume_command(self):
+        directory = Path(tempfile.mkdtemp())
+        manifest_path = directory / "clip.mp4.kie.json"
+        output_path = directory / "clip.mp4"
+        kie_client.write_manifest_atomic(manifest_path, {"taskId": "task_1"})
+        transport = FakeTransport([task_record("generating", progress=45)])
+        times = iter((0.0, 0.0, 60.0))
+
+        with self.assertRaisesRegex(
+            kie_client.TaskTimeoutError,
+            rf"wait --manifest {manifest_path} --output {output_path}",
+        ):
+            kie_client.wait_for_task(
+                "task_1",
+                "secret",
+                transport,
+                sleeper=lambda _: None,
+                timeout_seconds=60,
+                manifest_path=manifest_path,
+                output_path=output_path,
+                monotonic=lambda: next(times),
+            )
+
+        manifest = kie_client.load_manifest(manifest_path)
+        self.assertEqual(manifest["state"], "generating")
+        self.assertEqual(manifest["progress"], 45)
+
+
 # Keep this entry point at the end of the test file as later test classes are added.
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
+from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -23,8 +24,10 @@ VALID_ASPECT_RATIOS = {"16:9", "9:16"}
 VALID_RESOLUTIONS = {"720p"}
 UPLOAD_URL = "https://kieai.redpandaai.co/api/file-stream-upload"
 CREATE_TASK_URL = "https://api.kie.ai/api/v1/jobs/createTask"
+TASK_INFO_URL = "https://api.kie.ai/api/v1/jobs/recordInfo"
 MANIFEST_SCHEMA_VERSION = 1
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+ACTIVE_STATES = {"waiting", "queuing", "generating"}
 
 
 class ValidationError(ValueError):
@@ -33,6 +36,18 @@ class ValidationError(ValueError):
 
 class HttpError(RuntimeError):
     """Raised when a Kie.ai HTTP request cannot be completed."""
+
+
+class SchemaError(RuntimeError):
+    """Raised when Kie.ai returns a response outside its documented schema."""
+
+
+class TaskFailedError(RuntimeError):
+    """Raised when Kie.ai marks a video-generation task as failed."""
+
+
+class TaskTimeoutError(TimeoutError):
+    """Raised when waiting for a Kie.ai task exceeds its configured deadline."""
 
 
 @dataclass(frozen=True)
@@ -367,6 +382,110 @@ def submit_generation(
         },
     )
     return task_id
+
+
+def parse_task_record(data: Mapping[str, object]) -> tuple[str, str | None]:
+    """Parse one documented Kie.ai task record into its state and result URL."""
+    state = data.get("state")
+    if state in ACTIVE_STATES:
+        return state, None
+    if state == "fail":
+        raise TaskFailedError(f"{data.get('failCode', '')}: {data.get('failMsg', '')}")
+    if state != "success":
+        raise SchemaError(f"unexpected task state: {state!r}")
+    try:
+        result_json = data["resultJson"]
+        if not isinstance(result_json, str):
+            raise TypeError("resultJson must be a string")
+        result = json.loads(result_json)
+        url = result["resultUrls"][0]
+        if not isinstance(url, str) or not url:
+            raise TypeError("result URL must be a non-empty string")
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
+        raise SchemaError("successful task did not contain resultUrls[0]") from error
+    return state, url
+
+
+def _resume_command(manifest_path: Path | None, output_path: Path | None) -> str:
+    if manifest_path is None or output_path is None:
+        return "wait with the same task ID"
+    return f"wait --manifest {manifest_path} --output {output_path}"
+
+
+def _persist_task_observation(
+    manifest_path: Path | None,
+    task_id: str,
+    record: Mapping[str, object],
+) -> None:
+    if manifest_path is None:
+        return
+    manifest = load_manifest(manifest_path) or {"taskId": task_id}
+    manifest["taskId"] = task_id
+    manifest["state"] = record.get("state")
+    manifest["progress"] = record.get("progress")
+    manifest["updatedAt"] = datetime.now(timezone.utc).isoformat()
+    write_manifest_atomic(manifest_path, manifest)
+
+
+def wait_for_task(
+    task_id: str,
+    api_key: str,
+    transport: UrllibTransport,
+    sleeper=time.sleep,
+    randomizer=random.random,
+    timeout_seconds: int = 900,
+    manifest_path: Path | None = None,
+    output_path: Path | None = None,
+    monotonic=time.monotonic,
+) -> str:
+    """Poll a saved Kie.ai task until it succeeds, fails, or times out."""
+    if not task_id:
+        raise ValidationError("task ID must not be empty")
+    if not api_key:
+        raise ValidationError("KIE_API_KEY must be set in the environment")
+    if timeout_seconds <= 0:
+        raise ValidationError("timeout seconds must be positive")
+
+    deadline = monotonic() + timeout_seconds
+    attempt = 0
+    resume_command = _resume_command(manifest_path, output_path)
+    try:
+        while True:
+            if monotonic() >= deadline:
+                raise TaskTimeoutError(
+                    f"timed out waiting for task {task_id}; resume with {resume_command}"
+                )
+            response = request_with_retry(
+                lambda: transport.request(
+                    "GET",
+                    f"{TASK_INFO_URL}?{urlencode({'taskId': task_id})}",
+                    {"Authorization": f"Bearer {api_key}"},
+                ),
+                sleeper=sleeper,
+                randomizer=randomizer,
+            )
+            if response.status != 200:
+                raise HttpError(f"task polling failed with HTTP status {response.status}")
+            try:
+                payload = json.loads(response.body.decode("utf-8"))
+                record = payload["data"] if isinstance(payload, dict) else None
+            except (UnicodeDecodeError, json.JSONDecodeError, KeyError) as error:
+                raise SchemaError("task polling returned an invalid JSON response") from error
+            if (
+                not isinstance(payload, dict)
+                or payload.get("code") != 200
+                or not isinstance(record, dict)
+            ):
+                raise SchemaError("task polling returned an invalid response schema")
+
+            _persist_task_observation(manifest_path, task_id, record)
+            state, result_url = parse_task_record(record)
+            if result_url is not None:
+                return result_url
+            sleeper(min(30.0, 3.0 * (2**attempt)) + randomizer())
+            attempt += 1
+    except KeyboardInterrupt:
+        raise KeyboardInterrupt(f"interrupted while waiting; resume with {resume_command}")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
