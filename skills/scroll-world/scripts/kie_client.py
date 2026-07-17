@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import io
 import json
 import mimetypes
 import os
@@ -12,6 +13,7 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import redirect_stderr
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -774,8 +776,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the requested workflow with JSON output and stable client exit codes."""
     api_key = os.environ.get("KIE_API_KEY", "").strip()
+    parser_stderr = io.StringIO()
     try:
-        args = parse_args(argv)
+        with redirect_stderr(parser_stderr):
+            args = parse_args(argv)
         api_key = require_api_key()
         transport = UrllibTransport()
         if args.command == "generate-video":
@@ -793,6 +797,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Video ready.", file=sys.stderr)
         print(json.dumps(result, sort_keys=True))
         return 0
+    except SystemExit as error:
+        details = redact(parser_stderr.getvalue(), api_key)
+        if details:
+            print(details, end="", file=sys.stderr)
+        if error.code == 0:
+            return 0
+        message = redact("invalid command-line arguments", api_key)
+        print(json.dumps({"status": "error", "error": message}, sort_keys=True))
+        return VALIDATION_ERROR_EXIT
     except ValidationError as error:
         message = redact(str(error), api_key)
         print(f"Error: {message}", file=sys.stderr)

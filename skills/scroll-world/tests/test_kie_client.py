@@ -451,6 +451,77 @@ class EndToEndTests(unittest.TestCase):
     def tearDown(self):
         self.tempdir.cleanup()
 
+    def assert_main_validation_error(self, argv, api_key="secret-value"):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.dict(
+            os.environ, {"KIE_API_KEY": api_key}, clear=True
+        ):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                status = kie_client.main(argv)
+
+        self.assertEqual(status, kie_client.VALIDATION_ERROR_EXIT)
+        self.assertEqual(len(stdout.getvalue().strip().splitlines()), 1)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "error")
+        self.assertNotIn(api_key, stdout.getvalue() + stderr.getvalue())
+        return payload, stderr.getvalue()
+
+    def test_main_empty_argv_returns_json_validation_error(self):
+        payload, stderr = self.assert_main_validation_error([])
+        self.assertIn("argument", payload["error"])
+        self.assertIn("usage:", stderr)
+
+    def test_main_missing_required_generate_option_returns_json_validation_error(self):
+        config = make_config()
+        payload, stderr = self.assert_main_validation_error(
+            [
+                "generate-video",
+                "--prompt-file",
+                str(config.prompt_file),
+                "--start-image",
+                str(config.start_image),
+            ]
+        )
+        self.assertIn("argument", payload["error"])
+        self.assertIn("--output", stderr)
+
+    def test_main_invalid_integer_and_choice_return_json_validation_errors(self):
+        config = make_config()
+        cases = (
+            (
+                [
+                    "generate-video",
+                    "--prompt-file",
+                    str(config.prompt_file),
+                    "--start-image",
+                    str(config.start_image),
+                    "--output",
+                    str(config.output),
+                    "--duration",
+                    "not-an-integer",
+                ],
+                "invalid int value",
+                "secret-value",
+            ),
+            (["not-a-command"], "invalid choice", "not-a-command"),
+        )
+        for argv, expected, api_key in cases:
+            with self.subTest(argv=argv):
+                payload, stderr = self.assert_main_validation_error(argv, api_key)
+                self.assertIn("argument", payload["error"])
+                self.assertIn(expected, stderr)
+
+    def test_main_help_preserves_normal_exit_zero_behavior(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            status = kie_client.main(["--help"])
+
+        self.assertEqual(status, 0)
+        self.assertIn("generate-video", stdout.getvalue())
+        self.assertEqual(stderr.getvalue(), "")
+
     def test_download_uses_part_file_then_replaces_output(self):
         output = Path(self.tempdir.name) / "clip.mp4"
         transport = FakeTransport([binary_response(200, b"fake-mp4")])
